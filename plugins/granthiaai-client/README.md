@@ -43,6 +43,12 @@ to point at a remote engine:
 export GRANTHIAAI_MCP_URL="https://api-<region>.granthia.ai/mcp"
 ```
 
+## Updating
+
+Third-party marketplaces don't auto-update by default, so run `/plugin marketplace update
+granthiaai` periodically (or enable auto-update in `/plugin` -> Marketplaces) to get new
+releases; they apply on the next start or via `/reload-plugins`.
+
 ## Commands
 
 - `granthiaai login` - authorize background sync (device flow, tokens stored at

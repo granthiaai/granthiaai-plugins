@@ -16,6 +16,20 @@ Then set the engine endpoint for your region and authorize background sync - see
 plugin's own [README](./plugins/granthiaai-client/README.md) for the one-time setup
 (`GRANTHIAAI_MCP_URL`, `~/.granthiaai/config.json`, and `granthiaai login`).
 
+## Updating
+
+Claude Code does **not** auto-update plugins from third-party marketplaces by default, so
+you won't silently get new versions. To pick up fixes and new releases, either enable
+auto-update for this marketplace (in `/plugin` -> Marketplaces -> Enable auto-update) or
+periodically run:
+
+```
+/plugin marketplace update granthiaai
+```
+
+New versions are then applied on the next Claude Code start (or run `/reload-plugins` to
+apply immediately).
+
 ## Do not edit this repository directly
 
 It is a **published mirror**, generated from the private `granthiaai-saas` monorepo and
