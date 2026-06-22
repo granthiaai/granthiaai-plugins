@@ -1,5 +1,6 @@
 {
   "name": "granthiaai",
+  "description": "Granthia's plugin marketplace: capture your team's Claude Code conversations and search them from Claude over a private, hosted team knowledge base.",
   "owner": {
     "name": "Granthia",
     "url": "https://granthia.ai"

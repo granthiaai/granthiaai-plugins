@@ -29,18 +29,18 @@ background sync):
 
 ```json
 {
-  "engine_url": "https://api-<region>.granthia.ai",
+  "engine_url": "https://search.granthia.ai",
   "issuer_url": "https://auth.granthia.ai/realms/granthiaai"
 }
 ```
 
 The **MCP server URL** comes from the `GRANTHIAAI_MCP_URL` environment variable,
-which Claude Code expands in the plugin's `.mcp.json`. It **defaults to
-`http://localhost:8787/mcp`** (local dev), so set the variable in your shell profile
-to point at a remote engine:
+which Claude Code expands in the plugin's `.mcp.json`. It **defaults to the hosted
+service `https://search.granthia.ai/mcp`**, so it works out of the box. Override it only
+for local development:
 
 ```
-export GRANTHIAAI_MCP_URL="https://api-<region>.granthia.ai/mcp"
+export GRANTHIAAI_MCP_URL="http://localhost:8787/mcp"
 ```
 
 ## Updating

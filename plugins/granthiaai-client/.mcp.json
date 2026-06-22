@@ -2,7 +2,7 @@
   "mcpServers": {
     "granthiaai": {
       "type": "http",
-      "url": "${GRANTHIAAI_MCP_URL:-http://localhost:8787/mcp}"
+      "url": "${GRANTHIAAI_MCP_URL:-https://search.granthia.ai/mcp}"
     }
   }
 }
