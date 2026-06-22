@@ -1,0 +1,14 @@
+{
+  "name": "granthiaai",
+  "owner": {
+    "name": "Granthia",
+    "url": "https://granthia.ai"
+  },
+  "plugins": [
+    {
+      "name": "granthiaai-client",
+      "source": "./plugins/granthiaai-client",
+      "description": "Sync Claude Code conversation history to Granthia and search your team's AI-conversation knowledge base over a remote MCP server."
+    }
+  ]
+}
