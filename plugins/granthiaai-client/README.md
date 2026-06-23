@@ -25,14 +25,24 @@ knowledge base through a remote MCP server.
    login; a browser window opens to approve). Until you do, sync is a no-op and reminds you
    to log in.
 
-Configure the engine and issuer URLs in `~/.granthiaai/config.json` (used by
-background sync):
+Background sync's **engine and issuer URLs default to the hosted service**
+(`https://search.granthia.ai` and `https://auth.granthia.ai/realms/granthiaai`),
+so the steps above work out of the box against production. Override them in
+`~/.granthiaai/config.json` only for local development or self-hosting:
 
 ```json
 {
-  "engine_url": "https://search.granthia.ai",
-  "issuer_url": "https://auth.granthia.ai/realms/granthiaai"
+  "engine_url": "http://localhost:8787",
+  "issuer_url": "http://localhost:8080/realms/granthiaai"
 }
+```
+
+Or set them in the environment without editing the file (an explicit value in
+`config.json` takes precedence if both are present):
+
+```
+export GRANTHIAAI_ENGINE_URL="http://localhost:8787"
+export GRANTHIAAI_ISSUER_URL="http://localhost:8080/realms/granthiaai"
 ```
 
 The **MCP server URL** comes from the `GRANTHIAAI_MCP_URL` environment variable,

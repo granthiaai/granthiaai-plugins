@@ -1,7 +1,7 @@
 {
   "name": "granthiaai-client",
   "description": "Sync Claude Code conversation history to Granthia and search your team's AI-conversation knowledge base over a remote MCP server.",
-  "version": "2026.6.3",
+  "version": "2026.6.4",
   "author": {
     "name": "Granthia",
     "url": "https://granthia.ai"
