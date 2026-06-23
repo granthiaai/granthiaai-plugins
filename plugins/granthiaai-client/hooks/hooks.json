@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'SessionStart',additionalContext:'Granthia is connected to this workspace. Proactively use the search_knowledge MCP tool to check the team past Claude Code conversations for prior work before solving non-trivial problems, debugging errors, designing features, or answering have-we-done-this questions. Do not wait to be asked.'}}))\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -2,6 +2,8 @@
 
 // src/commands/login.ts
 import { setTimeout as delay } from "timers/promises";
+import { spawn } from "child_process";
+import { platform } from "os";
 
 // src/config.ts
 import { readFile } from "fs/promises";
@@ -128,11 +130,13 @@ async function login(opts, deps) {
     throw new Error(`device authorization request failed (${startRes.status})`);
   }
   const auth = await startRes.json();
+  const verifyUrl = auth.verification_uri_complete ?? auth.verification_uri;
   deps.log(
     `To authorize Granthia sync, visit:
-  ${auth.verification_uri_complete ?? auth.verification_uri}
+  ${verifyUrl}
 and enter the code: ${auth.user_code}`
   );
+  deps.openBrowser?.(verifyUrl);
   let intervalMs = (auth.interval ?? 5) * 1e3;
   const deadline = deps.now() + auth.expires_in * 1e3;
   for (; ; ) {
@@ -201,12 +205,35 @@ async function refresh(opts, refreshToken, deps) {
 }
 
 // src/commands/login.ts
+function openBrowser(url) {
+  let cmd;
+  let args;
+  switch (platform()) {
+    case "darwin":
+      cmd = "open";
+      args = [url];
+      break;
+    case "win32":
+      cmd = "rundll32";
+      args = ["url.dll,FileProtocolHandler", url];
+      break;
+    default:
+      cmd = "xdg-open";
+      args = [url];
+  }
+  try {
+    spawn(cmd, args, { stdio: "ignore", detached: true }).on("error", () => {
+    }).unref();
+  } catch {
+  }
+}
 function defaultOAuthDeps() {
   return {
     fetch: globalThis.fetch,
     now: () => Date.now(),
     sleep: (ms) => delay(ms),
-    log: (msg) => console.log(msg)
+    log: (msg) => console.log(msg),
+    openBrowser
   };
 }
 async function loginCommand(deps = defaultOAuthDeps()) {
@@ -234,7 +261,7 @@ async function logoutCommand() {
 import { readFile as readFile3 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.6.1" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.6.3" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
@@ -773,7 +800,7 @@ async function runSync(payload, deps = defaultDeps()) {
   await maintainLog(config.log, deps.now());
   const creds = await readCredentials();
   if (!creds) {
-    await appendLog("Not logged in. Run `granthiaai login` to authorize background sync.");
+    await appendLog("Not logged in. Run `/granthiaai-client:login` in Claude Code to authorize background sync.");
     return;
   }
   if (!config.engine_url || !config.issuer_url) {
@@ -851,7 +878,7 @@ async function runSync(payload, deps = defaultDeps()) {
     await appendLog("Workspace suspended - data is buffered and will sync once the workspace is reactivated.");
   }
   if (sawNeedsLogin) {
-    await appendLog("Session expired. Run `granthiaai login` again to resume background sync.");
+    await appendLog("Session expired. Run `/granthiaai-client:login` in Claude Code again to resume background sync.");
   }
 }
 

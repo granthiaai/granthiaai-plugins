@@ -21,8 +21,9 @@ knowledge base through a remote MCP server.
 ```
 
 1. On your first search, Claude Code prompts a one-time **MCP OAuth** in the browser.
-2. Run **`granthiaai login`** once to authorize **background sync** (a device-flow
-   browser login). Until you do, sync is a no-op and reminds you to log in.
+2. Run **`/granthiaai-client:login`** once to authorize **background sync** (a device-flow
+   login; a browser window opens to approve). Until you do, sync is a no-op and reminds you
+   to log in.
 
 Configure the engine and issuer URLs in `~/.granthiaai/config.json` (used by
 background sync):
@@ -51,11 +52,14 @@ releases; they apply on the next start or via `/reload-plugins`.
 
 ## Commands
 
-- `granthiaai login` - authorize background sync (device flow, tokens stored at
-  `~/.granthiaai/credentials.json`, mode 0600).
-- `granthiaai status` - login state, engine URL, last sync result.
-- `granthiaai logout` - remove cached credentials.
-- `granthiaai sync` - manual full-scan sync (the Stop hook does this automatically,
+Run these as slash commands inside Claude Code (they invoke the plugin's bundled binary -
+no separate CLI install needed):
+
+- `/granthiaai-client:login` - authorize background sync (device flow; a browser window
+  opens to approve, tokens stored at `~/.granthiaai/credentials.json`, mode 0600).
+- `/granthiaai-client:status` - login state, engine URL, last sync result.
+- `/granthiaai-client:logout` - remove cached credentials.
+- `/granthiaai-client:sync` - manual full-scan sync (the Stop hook does this automatically,
   targeted at the finished session).
 
 ## Notes
