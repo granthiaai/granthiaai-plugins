@@ -95,6 +95,7 @@ async function clearCredentials() {
 
 // src/oauth.ts
 import { createHash, randomBytes } from "crypto";
+import { createServer } from "http";
 function base64url(buf) {
   return buf.toString("base64url");
 }
@@ -115,10 +116,11 @@ async function discoverEndpoints(issuerUrl, fetchFn) {
   const res = await fetchFn(url);
   if (!res.ok) throw new Error(`OIDC discovery failed (${res.status}) at ${url}`);
   const doc = await res.json();
-  if (!doc.device_authorization_endpoint || !doc.token_endpoint) {
-    throw new Error("OIDC metadata is missing device_authorization_endpoint or token_endpoint");
+  if (!doc.token_endpoint) {
+    throw new Error("OIDC metadata is missing token_endpoint");
   }
   return {
+    authorization_endpoint: doc.authorization_endpoint,
     device_authorization_endpoint: doc.device_authorization_endpoint,
     token_endpoint: doc.token_endpoint
   };
@@ -132,9 +134,13 @@ function toCredentials(token, now) {
 }
 async function login(opts, deps) {
   const endpoints = await discoverEndpoints(opts.issuerUrl, deps.fetch);
+  const deviceEndpoint = endpoints.device_authorization_endpoint;
+  if (!deviceEndpoint) {
+    throw new Error("OIDC metadata is missing device_authorization_endpoint");
+  }
   const pkce = makePkce(deps.makeVerifier);
   const scope = opts.scope ?? "openid offline_access";
-  const startRes = await postForm(deps.fetch, endpoints.device_authorization_endpoint, {
+  const startRes = await postForm(deps.fetch, deviceEndpoint, {
     client_id: opts.clientId,
     scope,
     code_challenge: pkce.challenge,
@@ -146,9 +152,10 @@ async function login(opts, deps) {
   const auth = await startRes.json();
   const verifyUrl = auth.verification_uri_complete ?? auth.verification_uri;
   deps.log(
-    `To authorize Granthia sync, visit:
+    `A browser window will open to approve Granthia sync.
+If it does not open, visit this URL to authorize:
   ${verifyUrl}
-and enter the code: ${auth.user_code}`
+(enter code ${auth.user_code} if asked)`
   );
   deps.openBrowser?.(verifyUrl);
   let intervalMs = (auth.interval ?? 5) * 1e3;
@@ -183,6 +190,118 @@ and enter the code: ${auth.user_code}`
         throw new Error(`token request failed (${res.status})${body.error ? `: ${body.error}` : ""}`);
     }
   }
+}
+var DEFAULT_BROWSER_TIMEOUT_MS = 5 * 6e4;
+async function loginViaBrowser(opts, deps) {
+  const endpoints = await discoverEndpoints(opts.issuerUrl, deps.fetch);
+  if (!endpoints.authorization_endpoint) {
+    throw new Error("OIDC metadata is missing authorization_endpoint");
+  }
+  const pkce = makePkce(deps.makeVerifier);
+  const state = deps.makeState ? deps.makeState() : base64url(randomBytes(16));
+  const scope = opts.scope ?? "openid offline_access";
+  const listener = await (deps.listen ?? defaultLoopbackListener)();
+  try {
+    const authUrl = new URL(endpoints.authorization_endpoint);
+    authUrl.search = new URLSearchParams({
+      client_id: opts.clientId,
+      redirect_uri: listener.redirectUri,
+      response_type: "code",
+      scope,
+      code_challenge: pkce.challenge,
+      code_challenge_method: "S256",
+      state
+    }).toString();
+    deps.log(
+      `A browser window will open to sign in to Granthia.
+If it does not open, visit this URL to continue:
+  ${authUrl.toString()}`
+    );
+    deps.openBrowser?.(authUrl.toString());
+    const code = await listener.waitForCode(state, deps.timeoutMs ?? DEFAULT_BROWSER_TIMEOUT_MS);
+    const res = await postForm(deps.fetch, endpoints.token_endpoint, {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: listener.redirectUri,
+      client_id: opts.clientId,
+      code_verifier: pkce.verifier
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(
+        `token exchange failed (${res.status})${body.error ? `: ${body.error}` : ""}`
+      );
+    }
+    const token = await res.json();
+    return toCredentials(token, deps.now());
+  } finally {
+    listener.close();
+  }
+}
+function callbackPage(message) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Granthia</title></head><body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem;color:#2b2620;background:#f7f4ee"><p>${message}</p></body></html>`;
+}
+function defaultLoopbackListener() {
+  let resolveCode;
+  let rejectCode;
+  const codePromise = new Promise((resolve, reject) => {
+    resolveCode = resolve;
+    rejectCode = reject;
+  });
+  let expectedState = "";
+  const server = createServer((req, res) => {
+    const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (reqUrl.pathname !== "/callback") {
+      res.writeHead(404, { Connection: "close" }).end();
+      return;
+    }
+    const error = reqUrl.searchParams.get("error");
+    const code = reqUrl.searchParams.get("code");
+    const state = reqUrl.searchParams.get("state");
+    const send = (msg) => {
+      res.writeHead(200, { "Content-Type": "text/html", Connection: "close" }).end(callbackPage(msg));
+    };
+    if (error) {
+      send("Sign-in failed. You can close this tab and return to the terminal.");
+      rejectCode(new Error(`authorization failed: ${error}`));
+    } else if (!code || state !== expectedState) {
+      send("Sign-in failed. You can close this tab and return to the terminal.");
+      rejectCode(new Error("invalid authorization response (state mismatch)"));
+    } else {
+      send("Signed in to Granthia. You can close this tab and return to the terminal.");
+      resolveCode(code);
+    }
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        redirectUri: `http://127.0.0.1:${port}/callback`,
+        waitForCode: (state, timeoutMs) => {
+          expectedState = state;
+          let timer;
+          const timeout = new Promise((_, rej) => {
+            timer = setTimeout(
+              () => rej(
+                new Error(
+                  "timed out waiting for browser sign-in; run `granthiaai login` again"
+                )
+              ),
+              timeoutMs
+            );
+          });
+          return Promise.race([codePromise, timeout]).finally(() => clearTimeout(timer));
+        },
+        // Force-destroy any lingering (e.g. browser preconnect) sockets so the
+        // process exits promptly; server.close() alone would wait for them.
+        close: () => {
+          server.closeAllConnections();
+          server.close();
+        }
+      });
+    });
+  });
 }
 async function refresh(opts, refreshToken, deps) {
   let endpoints;
@@ -250,19 +369,31 @@ function defaultOAuthDeps() {
     openBrowser
   };
 }
-async function loginCommand(deps = defaultOAuthDeps()) {
+function defaultBrowserDeps() {
+  return {
+    fetch: globalThis.fetch,
+    now: () => Date.now(),
+    log: (msg) => console.log(msg),
+    openBrowser
+  };
+}
+async function loginCommand(opts = {}) {
   const config = await loadConfig();
   if (!config.issuer_url) {
     throw new Error(
       "issuer_url is not set. Add it to ~/.granthiaai/config.json (the Keycloak realm URL)."
     );
   }
-  deps.log(`Authorizing background sync against ${config.issuer_url}`);
-  const credentials = await login(
-    { issuerUrl: config.issuer_url, clientId: config.client_id },
-    deps
-  );
-  await writeCredentials(credentials);
+  const loginOpts = { issuerUrl: config.issuer_url, clientId: config.client_id };
+  if (opts.headless) {
+    const deps = opts.deviceDeps ?? defaultOAuthDeps();
+    deps.log(`Authorizing background sync against ${config.issuer_url}`);
+    await writeCredentials(await login(loginOpts, deps));
+  } else {
+    const deps = opts.browserDeps ?? defaultBrowserDeps();
+    deps.log(`Authorizing background sync against ${config.issuer_url}`);
+    await writeCredentials(await loginViaBrowser(loginOpts, deps));
+  }
   console.log("Logged in. Background sync is now authorized.");
 }
 
@@ -276,7 +407,7 @@ async function logoutCommand() {
 import { readFile as readFile3 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.6.4" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.6.5" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
@@ -5016,7 +5147,7 @@ async function runSync(payload, deps = defaultDeps()) {
 var USAGE = `Granthia CLI
 
 Usage:
-  granthiaai login    Authorize background sync (device-flow OAuth)
+  granthiaai login    Authorize background sync (opens the browser; --headless for device flow)
   granthiaai logout   Remove cached credentials
   granthiaai status   Show login state, engine URL, and last sync
   granthiaai sync     Sync sessions (Stop hook = targeted; manual = full scan)`;
@@ -5036,7 +5167,7 @@ async function main() {
   const command = process.argv[2];
   switch (command) {
     case "login":
-      await loginCommand();
+      await loginCommand({ headless: process.argv.includes("--headless") });
       return;
     case "logout":
       await logoutCommand();
