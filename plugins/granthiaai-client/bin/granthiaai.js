@@ -111,9 +111,25 @@ async function postForm(fetchFn, url, fields) {
     body: new URLSearchParams(fields).toString()
   });
 }
+async function reachableFetch(fetchFn, url, init) {
+  try {
+    return await fetchFn(url, init);
+  } catch (err) {
+    const code = err.cause?.code;
+    let where;
+    try {
+      where = new URL(url).origin;
+    } catch {
+      where = url;
+    }
+    throw new Error(
+      `Granthia service not reachable at ${where}` + (code ? ` (${code})` : "") + `. Check engine_url / issuer_url in ~/.granthiaai/config.json (or GRANTHIAAI_ENGINE_URL / GRANTHIAAI_ISSUER_URL), and that the service is up.`
+    );
+  }
+}
 async function discoverEndpoints(issuerUrl, fetchFn) {
   const url = `${issuerUrl.replace(/\/+$/, "")}/.well-known/openid-configuration`;
-  const res = await fetchFn(url);
+  const res = await reachableFetch(fetchFn, url);
   if (!res.ok) throw new Error(`OIDC discovery failed (${res.status}) at ${url}`);
   const doc = await res.json();
   if (!doc.token_endpoint) {
@@ -268,7 +284,7 @@ function defaultLoopbackListener() {
       send("Sign-in failed. You can close this tab and return to the terminal.");
       rejectCode(new Error("invalid authorization response (state mismatch)"));
     } else {
-      send("Signed in to Granthia. You can close this tab and return to the terminal.");
+      send("Signed in to Granthia CLI. You can close this tab and return to the terminal.");
       resolveCode(code);
     }
   });
@@ -407,7 +423,7 @@ async function logoutCommand() {
 import { readFile as readFile3 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.6.5" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.6.6" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {

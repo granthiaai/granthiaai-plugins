@@ -21,9 +21,9 @@ knowledge base through a remote MCP server.
 ```
 
 1. On your first search, Claude Code prompts a one-time **MCP OAuth** in the browser.
-2. Run **`/granthiaai-client:login`** once to authorize **background sync** (a device-flow
-   login; a browser window opens to approve). Until you do, sync is a no-op and reminds you
-   to log in.
+2. Run **`/granthiaai-client:login`** once to authorize **background sync** (a browser
+   window opens to sign in; add `--headless` for the device flow on headless/SSH boxes).
+   Until you do, sync is a no-op and reminds you to log in.
 
 Background sync's **engine and issuer URLs default to the hosted service**
 (`https://search.granthia.ai` and `https://auth.granthia.ai/realms/granthiaai`),
@@ -45,14 +45,18 @@ export GRANTHIAAI_ENGINE_URL="http://localhost:8787"
 export GRANTHIAAI_ISSUER_URL="http://localhost:8080/realms/granthiaai"
 ```
 
-The **MCP server URL** comes from the `GRANTHIAAI_MCP_URL` environment variable,
-which Claude Code expands in the plugin's `.mcp.json`. It **defaults to the hosted
-service `https://search.granthia.ai/mcp`**, so it works out of the box. Override it only
-for local development:
+The **MCP server URL** is derived from the same `GRANTHIAAI_ENGINE_URL` that background
+sync uses: Claude Code expands `${GRANTHIAAI_ENGINE_URL:-https://search.granthia.ai}/mcp`
+in the plugin's `.mcp.json` (only the trailing `/mcp` is fixed). It **defaults to the
+hosted service**, so it works out of the box, and a single override points **both** search
+and sync at a local engine:
 
 ```
-export GRANTHIAAI_MCP_URL="http://localhost:8787/mcp"
+export GRANTHIAAI_ENGINE_URL="http://localhost:8787"
 ```
+
+This must be an environment variable (Claude Code reads it for `.mcp.json`); the
+`engine_url` in `config.json` steers background sync only, not search.
 
 ## Updating
 
@@ -65,8 +69,9 @@ releases; they apply on the next start or via `/reload-plugins`.
 Run these as slash commands inside Claude Code (they invoke the plugin's bundled binary -
 no separate CLI install needed):
 
-- `/granthiaai-client:login` - authorize background sync (device flow; a browser window
-  opens to approve, tokens stored at `~/.granthiaai/credentials.json`, mode 0600).
+- `/granthiaai-client:login` - authorize background sync (a browser window opens to sign
+  in; `--headless` uses the device flow; tokens stored at `~/.granthiaai/credentials.json`,
+  mode 0600).
 - `/granthiaai-client:status` - login state, engine URL, last sync result.
 - `/granthiaai-client:logout` - remove cached credentials.
 - `/granthiaai-client:sync` - manual full-scan sync (the Stop hook does this automatically,
