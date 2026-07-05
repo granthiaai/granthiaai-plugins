@@ -255,7 +255,7 @@ If it does not open, visit this URL to continue:
   }
 }
 function callbackPage(message) {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Granthia</title></head><body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem;color:#2b2620;background:#f7f4ee"><p>${message}</p></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Granthia</title></head><body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem;color:#171a1f;background:#f8fafc"><p>${message}</p></body></html>`;
 }
 function defaultLoopbackListener() {
   let resolveCode;
@@ -397,7 +397,7 @@ async function loginCommand(opts = {}) {
   const config = await loadConfig();
   if (!config.issuer_url) {
     throw new Error(
-      "issuer_url is not set. Add it to ~/.granthiaai/config.json (the Keycloak realm URL)."
+      "issuer_url is not set. Add it to ~/.granthiaai/config.json (your Granthia OIDC issuer URL)."
     );
   }
   const loginOpts = { issuerUrl: config.issuer_url, clientId: config.client_id };
@@ -423,7 +423,7 @@ async function logoutCommand() {
 import { readFile as readFile3 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.6.6" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.1" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
