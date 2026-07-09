@@ -423,7 +423,7 @@ async function logoutCommand() {
 import { readFile as readFile3 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.1" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.2" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
@@ -4585,9 +4585,10 @@ var ingestResponse = external_exports.object({
   // When set and the client is older, the CLI prints a one-time update advisory.
   // Omitted entirely when no floor is configured.
   min_version: external_exports.string().min(1).optional(),
-  // Phase 5b: why a synced:0 no-op was returned (storage cap reached, or the tenant
-  // is suspended). The CLI surfaces this once and keeps its buffer. Absent on success.
-  reason: external_exports.enum(["storage_cap", "suspended"]).optional()
+  // Phase 5b: why a synced:0 no-op was returned (storage cap reached, the tenant's
+  // Pro-tier maximum storage size was reached, or the tenant is suspended). The CLI
+  // surfaces this once and keeps its buffer. Absent on success.
+  reason: external_exports.enum(["storage_cap", "storage_limit", "suspended"]).optional()
 });
 var INGEST_MAX_BATCH_BYTES = 6 * 1024 * 1024;
 var INGEST_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -5151,6 +5152,10 @@ async function runSync(payload, deps = defaultDeps()) {
   }
   if (cappedReason === "storage_cap") {
     await appendLog("Storage limit reached - data is buffered and will sync once you free space or upgrade your plan.");
+  } else if (cappedReason === "storage_limit") {
+    await appendLog(
+      "Maximum storage size reached - data is buffered. Raise your maximum storage size in the Granthia dashboard, or delete data, to resume ingest."
+    );
   } else if (cappedReason === "suspended") {
     await appendLog("Workspace suspended - data is buffered and will sync once the workspace is reactivated.");
   }
