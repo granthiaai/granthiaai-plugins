@@ -423,7 +423,7 @@ async function logoutCommand() {
 import { readFile as readFile3 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.2" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.3" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
