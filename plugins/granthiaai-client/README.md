@@ -23,7 +23,9 @@ knowledge base through a remote MCP server.
 1. On your first search, Claude Code prompts a one-time **MCP OAuth** in the browser.
 2. Run **`/granthiaai-client:login`** once to authorize **background sync** (a browser
    window opens to sign in; add `--headless` for the device flow on headless/SSH boxes).
-   Until you do, sync is a no-op and reminds you to log in.
+   Until you do, sync is a no-op and reminds you to log in. Claude Code will ask you to
+   approve the command the first time - that is expected; see
+   [approval](#this-command-requires-approval-when-running-a-command) to stop being asked.
 
 Background sync's **engine and issuer URLs default to the hosted service**
 (`https://search.granthia.ai` and `https://auth.granthia.ai/realms/granthiaai`),
@@ -44,6 +46,29 @@ Or set them in the environment without editing the file (an explicit value in
 export GRANTHIAAI_ENGINE_URL="http://localhost:8787"
 export GRANTHIAAI_ISSUER_URL="http://localhost:8080/realms/granthiaai"
 ```
+
+### Data residency: how search and sync find your region
+
+Your data is stored in the region you chose at signup, and the client talks to that region
+directly. **You do not configure this** - signing in asks the Granthia control
+plane where your data lives and points the client at it:
+
+- **Background sync (ingest)** reads the endpoint from `~/.granthiaai/config.json`. It is
+  regional the moment you log in.
+- **Search (the MCP server)** is connected by Claude Code, not by us. Claude Code expands
+  `${GRANTHIAAI_ENGINE_URL}` in this plugin's `.mcp.json` from its **environment**, at
+  **startup** - it never reads `config.json`. So login also writes that variable into
+  `~/.claude/settings.json`'s `env` block (merging: your other settings are untouched).
+
+Because Claude Code reads that block at startup, **restart Claude Code after your first
+login** so search uses your region. Login tells you when this is needed. Until you restart,
+a search sent to the wrong region is **refused**, never answered with the wrong data.
+
+If your tenant is ever migrated to another region, background sync notices (the old region
+starts refusing it), re-resolves against the control plane, and updates both endpoints
+automatically. You will be asked to restart Claude Code once more.
+
+### Overriding the endpoint (dev / self-host)
 
 The **MCP server URL** is derived from the same `GRANTHIAAI_ENGINE_URL` that background
 sync uses: Claude Code expands `${GRANTHIAAI_ENGINE_URL:-https://search.granthia.ai}/mcp`
@@ -76,6 +101,56 @@ no separate CLI install needed):
 - `/granthiaai-client:logout` - remove cached credentials.
 - `/granthiaai-client:sync` - manual full-scan sync (the Stop hook does this automatically,
   targeted at the finished session).
+
+### "This command requires approval" when running a command
+
+Each of these commands runs the plugin's bundled binary through Node, and Claude Code asks
+before running any shell command it has not been told to trust. **Approve it and the command
+runs normally** - that is the expected first-run experience, not a fault.
+
+Approving is also the safest answer, and you will rarely be asked: `login` is a one-time
+step, and background sync never goes through these commands at all - the Stop hook invokes
+the binary directly.
+
+If you would rather not be asked, allow it in your own settings (`~/.claude/settings.json`
+for every project, or `.claude/settings.json` for one):
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(node:*)"]
+  }
+}
+```
+
+**Understand what that grants before you paste it:** it trusts *any* command starting with
+`node` in that scope from then on, including `node -e "<code>"`. It is not scoped to this
+plugin.
+
+A narrower rule that still survives plugin updates - Claude Code matches `*` at any position,
+so the version in the path does not have to be spelled out:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(node *granthiaai-client/*/bin/granthiaai.js*)"]
+  }
+}
+```
+
+Treat that as narrower, not as a security boundary: Claude Code's own documentation warns
+that Bash rules constraining arguments are fragile.
+
+The commands also declare `allowed-tools: Bash(node:*)` themselves, which is the documented
+way for a command to pre-authorize its own shell call. If you are prompted anyway, the
+settings entry above is the reliable route.
+
+To skip Claude Code entirely, run the binary in a terminal - the path is the one named in
+the approval prompt:
+
+```
+node ~/.claude/plugins/cache/granthiaai/granthiaai-client/<version>/bin/granthiaai.js login
+```
 
 ## Notes
 

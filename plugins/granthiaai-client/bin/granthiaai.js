@@ -11,7 +11,8 @@ import { spawn } from "child_process";
 import { platform } from "os";
 
 // src/config.ts
-import { readFile } from "fs/promises";
+import { readFile, writeFile, mkdir } from "fs/promises";
+import { dirname } from "path";
 
 // src/paths.ts
 import { homedir } from "os";
@@ -53,6 +54,7 @@ var DEFAULT_LOG = {
 var DEFAULT_CLIENT_ID = "granthiaai-cli";
 var DEFAULT_ISSUER_URL = "https://auth.granthia.ai/realms/granthiaai";
 var DEFAULT_ENGINE_URL = "https://search.granthia.ai";
+var DEFAULT_CONTROL_URL = "https://granthia.ai";
 function envUrl(name) {
   const v = process.env[name];
   return v && v.length > 0 ? v : void 0;
@@ -61,32 +63,119 @@ function withDefaults(raw) {
   return {
     engine_url: raw.engine_url ?? envUrl("GRANTHIAAI_ENGINE_URL") ?? DEFAULT_ENGINE_URL,
     issuer_url: raw.issuer_url ?? envUrl("GRANTHIAAI_ISSUER_URL") ?? DEFAULT_ISSUER_URL,
+    control_url: raw.control_url ?? envUrl("GRANTHIAAI_CONTROL_URL") ?? DEFAULT_CONTROL_URL,
     client_id: raw.client_id ?? DEFAULT_CLIENT_ID,
     excluded_projects: raw.excluded_projects ?? [],
     log: { ...DEFAULT_LOG, ...raw.log ?? {} }
   };
 }
 async function loadConfig() {
-  let raw = {};
+  return withDefaults(await readRawConfig());
+}
+async function readRawConfig() {
   try {
-    raw = JSON.parse(await readFile(configPath(), "utf-8"));
+    return JSON.parse(await readFile(configPath(), "utf-8"));
   } catch {
+    return {};
   }
-  return withDefaults(raw);
+}
+async function saveEngineUrl(engineUrl) {
+  const raw = await readRawConfig();
+  if (raw.engine_url === engineUrl) return;
+  const next = { ...raw, engine_url: engineUrl };
+  await mkdir(dirname(configPath()), { recursive: true });
+  await writeFile(configPath(), `${JSON.stringify(next, null, 2)}
+`);
+}
+
+// src/region.ts
+async function fetchPlacement(controlUrl, accessToken, deps = { fetch: globalThis.fetch }) {
+  try {
+    const url = `${controlUrl.replace(/\/+$/, "")}/api/me`;
+    const res = await deps.fetch(url, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+      // Bounded. Without a signal, undici waits on its 300s headersTimeout - and the case that
+      // stalls is exactly the one this code exists to detect (an endpoint that accepts the TCP
+      // connection and then never answers). login() awaits this AFTER writing credentials, so an
+      // unbounded wait looks like a five-minute hang and the user kills it.
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!res?.ok) return null;
+    const body = await res.json();
+    if (typeof body?.region !== "string" || typeof body?.dataPlaneBaseUrl !== "string") {
+      return null;
+    }
+    if (body.region.length === 0 || body.dataPlaneBaseUrl.length === 0) return null;
+    if (!await probe(body.dataPlaneBaseUrl, deps)) return null;
+    return { region: body.region, dataPlaneBaseUrl: body.dataPlaneBaseUrl };
+  } catch {
+    return null;
+  }
+}
+async function probe(baseUrl, deps) {
+  try {
+    const res = await deps.fetch(`${baseUrl.replace(/\/+$/, "")}/health`, {
+      method: "GET",
+      // Same reasoning: a region that accepts the connection and stalls is precisely what a health
+      // probe must treat as unhealthy, not as "still thinking".
+      signal: AbortSignal.timeout(5e3)
+    });
+    return Boolean(res?.ok);
+  } catch {
+    return false;
+  }
+}
+
+// src/claude-settings.ts
+import { readFile as readFile2, writeFile as writeFile2, rename, mkdir as mkdir2 } from "fs/promises";
+import { homedir as homedir2 } from "os";
+import { join as join2, dirname as dirname2 } from "path";
+function settingsPath() {
+  return join2(homedir2(), ".claude", "settings.json");
+}
+async function mirrorEngineUrlToClaudeEnv(engineUrl) {
+  try {
+    const file = settingsPath();
+    let settings = {};
+    try {
+      const raw = await readFile2(file, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+      settings = parsed;
+    } catch (err) {
+      const code = err?.code;
+      if (code !== "ENOENT") return false;
+    }
+    const env = settings.env;
+    if (env !== void 0 && (typeof env !== "object" || env === null || Array.isArray(env))) {
+      return false;
+    }
+    if (env?.GRANTHIAAI_ENGINE_URL === engineUrl) return false;
+    settings.env = { ...env ?? {}, GRANTHIAAI_ENGINE_URL: engineUrl };
+    await mkdir2(dirname2(file), { recursive: true });
+    const tmp = `${file}.granthiaai.${process.pid}.tmp`;
+    await writeFile2(tmp, `${JSON.stringify(settings, null, 2)}
+`);
+    await rename(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // src/credentials.ts
-import { chmod, mkdir, readFile as readFile2, rm, writeFile } from "fs/promises";
+import { chmod, mkdir as mkdir3, readFile as readFile3, rm, writeFile as writeFile3 } from "fs/promises";
 async function readCredentials() {
   try {
-    return JSON.parse(await readFile2(credentialsPath(), "utf-8"));
+    return JSON.parse(await readFile3(credentialsPath(), "utf-8"));
   } catch {
     return null;
   }
 }
 async function writeCredentials(creds) {
-  await mkdir(granthiaaiDir(), { recursive: true });
-  await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { mode: 384 });
+  await mkdir3(granthiaaiDir(), { recursive: true });
+  await writeFile3(credentialsPath(), JSON.stringify(creds, null, 2), { mode: 384 });
   await chmod(credentialsPath(), 384);
 }
 async function clearCredentials() {
@@ -401,14 +490,32 @@ async function loginCommand(opts = {}) {
     );
   }
   const loginOpts = { issuerUrl: config.issuer_url, clientId: config.client_id };
+  let credentials;
   if (opts.headless) {
     const deps = opts.deviceDeps ?? defaultOAuthDeps();
     deps.log(`Authorizing background sync against ${config.issuer_url}`);
-    await writeCredentials(await login(loginOpts, deps));
+    credentials = await login(loginOpts, deps);
   } else {
     const deps = opts.browserDeps ?? defaultBrowserDeps();
     deps.log(`Authorizing background sync against ${config.issuer_url}`);
-    await writeCredentials(await loginViaBrowser(loginOpts, deps));
+    credentials = await loginViaBrowser(loginOpts, deps);
+  }
+  await writeCredentials(credentials);
+  const fetchImpl = opts.deviceDeps?.fetch ?? opts.browserDeps?.fetch ?? globalThis.fetch;
+  const placement = await fetchPlacement(config.control_url, credentials.access_token, {
+    fetch: fetchImpl
+  });
+  if (placement) {
+    await saveEngineUrl(placement.dataPlaneBaseUrl);
+    const mcpUpdated = await mirrorEngineUrlToClaudeEnv(placement.dataPlaneBaseUrl);
+    console.log(
+      `Your data is stored in the ${placement.region} region (${placement.dataPlaneBaseUrl}).`
+    );
+    if (mcpUpdated) {
+      console.log(
+        "Restart Claude Code so search uses your region (background sync already does)."
+      );
+    }
   }
   console.log("Logged in. Background sync is now authorized.");
 }
@@ -420,15 +527,15 @@ async function logoutCommand() {
 }
 
 // src/commands/status.ts
-import { readFile as readFile3 } from "fs/promises";
+import { readFile as readFile4 } from "fs/promises";
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.3" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.4" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
   try {
-    const lines = (await readFile3(syncLogPath(), "utf-8")).split("\n").filter((l) => l.trim());
+    const lines = (await readFile4(syncLogPath(), "utf-8")).split("\n").filter((l) => l.trim());
     return lines.length ? lines[lines.length - 1] : null;
   } catch {
     return null;
@@ -456,18 +563,18 @@ async function statusCommand() {
 }
 
 // src/sync.ts
-import { readdir, readFile as readFile6 } from "fs/promises";
-import { basename as basename2, dirname, join as join2 } from "path";
+import { readdir, readFile as readFile7 } from "fs/promises";
+import { basename as basename2, dirname as dirname3, join as join3 } from "path";
 
 // src/lock.ts
-import { mkdir as mkdir2, open, readFile as readFile4, rm as rm2, stat } from "fs/promises";
+import { mkdir as mkdir4, open, readFile as readFile5, rm as rm2, stat } from "fs/promises";
 var STALE_MS = 10 * 60 * 1e3;
 var REFRESH_LOCK_WAIT_MS = 15 * 1e3;
 var REFRESH_LOCK_POLL_MS = 100;
 var REFRESH_LOCK_STALE_MS = 60 * 1e3;
 async function isStale(path, now, staleMs = STALE_MS) {
   try {
-    const data = JSON.parse(await readFile4(path, "utf-8"));
+    const data = JSON.parse(await readFile5(path, "utf-8"));
     if (typeof data.at === "number") return now - data.at > staleMs;
   } catch {
   }
@@ -503,7 +610,7 @@ async function acquireLock(sessionPath, now = Date.now()) {
   return null;
 }
 async function acquireRefreshLock(deps) {
-  await mkdir2(granthiaaiDir(), { recursive: true });
+  await mkdir4(granthiaaiDir(), { recursive: true });
   const path = refreshLockPath();
   const deadline = deps.now() + REFRESH_LOCK_WAIT_MS;
   for (; ; ) {
@@ -4588,7 +4695,15 @@ var ingestResponse = external_exports.object({
   // Phase 5b: why a synced:0 no-op was returned (storage cap reached, the tenant's
   // Pro-tier maximum storage size was reached, or the tenant is suspended). The CLI
   // surfaces this once and keeps its buffer. Absent on success.
-  reason: external_exports.enum(["storage_cap", "storage_limit", "suspended"]).optional()
+  // "migrating" = a residency migration is in flight; ingest is frozen. The CLI treats every
+  // one of these identically: KEEP THE BUFFER, surface once, do not retry-spin. So a freeze
+  // needs no new client contract - the chunks simply land in the NEW region on the next sync
+  // after the move completes.
+  reason: external_exports.enum(["storage_cap", "storage_limit", "suspended", "migrating"]).optional()
+});
+var misdirectedResponse = external_exports.object({
+  error: external_exports.string(),
+  region: external_exports.string().min(1).nullable().optional()
 });
 var INGEST_MAX_BATCH_BYTES = 6 * 1024 * 1024;
 var INGEST_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -4669,7 +4784,7 @@ function getHostname() {
 }
 
 // src/session-sync.ts
-import { readFile as readFile5, writeFile as writeFile2, rm as rm3 } from "fs/promises";
+import { readFile as readFile6, writeFile as writeFile4, rm as rm3 } from "fs/promises";
 import { basename } from "path";
 
 // src/jsonl-parser.ts
@@ -4846,6 +4961,13 @@ async function postBatch(engineUrl, accessToken, meta, chunks, deps) {
   }
   if (res.status === 401) return { kind: "unauthorized" };
   if (res.status === 403) return { kind: "no_tenant" };
+  if (res.status === 421) {
+    const region = await res.json().then((b) => {
+      const r = b.region;
+      return typeof r === "string" ? r : null;
+    }).catch(() => null);
+    return { kind: "misdirected", region };
+  }
   if (res.status === 413) {
     return { kind: "outage", message: "ingest body too large (413); engine bodyLimit may be below the client batch budget" };
   }
@@ -4887,7 +5009,7 @@ async function refreshUnderLock(auth, used, deps) {
 }
 async function getWatermark(path) {
   try {
-    const raw = await readFile5(path, "utf-8");
+    const raw = await readFile6(path, "utf-8");
     const parts = raw.trim().split(":");
     return { line: parseInt(parts[0] ?? "", 10) || 0, nextTurnIndex: parseInt(parts[1] ?? "", 10) || 0 };
   } catch {
@@ -4896,7 +5018,7 @@ async function getWatermark(path) {
 }
 async function readLinesOrNull(path) {
   try {
-    return (await readFile5(path, "utf-8")).split("\n");
+    return (await readFile6(path, "utf-8")).split("\n");
   } catch {
     return null;
   }
@@ -4927,17 +5049,17 @@ async function syncSession(params) {
   const delta = pendingLines && weight(sourceDelta) < weight(pendingLines) ? pendingLines : sourceDelta;
   if (weight(delta) === 0) {
     if (pendingLines) await rm3(pending, { force: true });
-    if (sourceLen !== watermark) await writeFile2(cursor, `${sourceLen}:${nextTurnIndex}`);
+    if (sourceLen !== watermark) await writeFile4(cursor, `${sourceLen}:${nextTurnIndex}`);
     return { result: { kind: "nothing" }, credentials };
   }
   const turns = filterConversationTurns(parseJSONL(delta.join("\n")));
   const chunks = chunkTurns(turns, nextTurnIndex);
   if (chunks.length === 0) {
     if (pendingLines) await rm3(pending, { force: true });
-    await writeFile2(cursor, `${sourceLen}:${nextTurnIndex}`);
+    await writeFile4(cursor, `${sourceLen}:${nextTurnIndex}`);
     return { result: { kind: "nothing" }, credentials };
   }
-  await writeFile2(pending, delta.map(redactSecrets).join("\n"));
+  await writeFile4(pending, delta.map(redactSecrets).join("\n"));
   const meta = { repo_url: repoUrl, hostname: hostname2, session_id: sessionId };
   const redacted = redactChunks(chunks);
   const send = (accessToken) => postIngest(engineUrl, accessToken, meta, redacted, { fetch: deps.fetch, timeoutMs: deps.timeoutMs });
@@ -4959,13 +5081,15 @@ async function syncSession(params) {
         return { result: { kind: "capped", reason: outcome.reason }, credentials };
       }
       await rm3(pending, { force: true });
-      await writeFile2(cursor, `${sourceLen}:${nextTurnIndex + chunks.length}`);
+      await writeFile4(cursor, `${sourceLen}:${nextTurnIndex + chunks.length}`);
       return {
         result: { kind: "synced", synced: outcome.synced, minVersion: outcome.minVersion },
         credentials
       };
     case "no_tenant":
       return { result: { kind: "no_tenant" }, credentials };
+    case "misdirected":
+      return { result: { kind: "misdirected", region: outcome.region }, credentials };
     case "unauthorized":
       return { result: { kind: "outage", message: "still unauthorized after refresh" }, credentials };
     case "outage":
@@ -4975,7 +5099,7 @@ async function syncSession(params) {
 }
 
 // src/log.ts
-import { appendFile, mkdir as mkdir3, rename, rm as rm4, stat as stat2 } from "fs/promises";
+import { appendFile, mkdir as mkdir5, rename as rename2, rm as rm4, stat as stat2 } from "fs/promises";
 var BEARER = /\b[Bb]earer\s+[A-Za-z0-9._-]+/g;
 async function fileSize(path) {
   try {
@@ -4986,12 +5110,12 @@ async function fileSize(path) {
 }
 async function safeRename(from, to) {
   try {
-    await rename(from, to);
+    await rename2(from, to);
   } catch {
   }
 }
 async function maintainLog(cfg, now = Date.now()) {
-  await mkdir3(granthiaaiDir(), { recursive: true });
+  await mkdir5(granthiaaiDir(), { recursive: true });
   const base = syncLogPath();
   if (await fileSize(base) > cfg.max_bytes) {
     await rm4(`${base}.${cfg.max_rotations}`, { force: true });
@@ -5010,7 +5134,7 @@ async function maintainLog(cfg, now = Date.now()) {
   }
 }
 async function appendLog(line) {
-  await mkdir3(granthiaaiDir(), { recursive: true });
+  await mkdir5(granthiaaiDir(), { recursive: true });
   const safe = line.replace(BEARER, "Bearer [REDACTED]");
   await appendFile(syncLogPath(), safe.endsWith("\n") ? safe : `${safe}
 `);
@@ -5033,7 +5157,7 @@ function compareVersions(a, b) {
 }
 async function cwdFromSession(sessionPath) {
   try {
-    const raw = await readFile6(sessionPath, "utf-8");
+    const raw = await readFile7(sessionPath, "utf-8");
     for (const line of raw.split("\n")) {
       const t = line.trim();
       if (!t) continue;
@@ -5059,7 +5183,7 @@ async function fullScanTargets(excluded) {
   const targets = [];
   for (const dir of dirs) {
     if (exclude.has(dir)) continue;
-    const projectDir = join2(root, dir);
+    const projectDir = join3(root, dir);
     let files;
     try {
       files = await readdir(projectDir);
@@ -5068,7 +5192,7 @@ async function fullScanTargets(excluded) {
     }
     for (const f of files) {
       if (!f.endsWith(".jsonl")) continue;
-      const sessionPath = join2(projectDir, f);
+      const sessionPath = join3(projectDir, f);
       targets.push({ sessionPath, cwd: await cwdFromSession(sessionPath), projectDirName: dir });
     }
   }
@@ -5090,7 +5214,7 @@ async function runSync(payload, deps = defaultDeps()) {
     {
       sessionPath: payload.transcript_path,
       cwd: payload.cwd ?? null,
-      projectDirName: basename2(dirname(payload.transcript_path))
+      projectDirName: basename2(dirname3(payload.transcript_path))
     }
   ] : await fullScanTargets(config.excluded_projects);
   const sessionDeps = { fetch: deps.fetch, now: deps.now, timeoutMs: deps.timeoutMs };
@@ -5099,20 +5223,51 @@ async function runSync(payload, deps = defaultDeps()) {
   let sawNeedsLogin = false;
   let sawNoTenant = false;
   let cappedReason;
+  let engineUrl = config.engine_url;
+  let reResolved = false;
   for (const t of targets) {
     const lock = await acquireLock(t.sessionPath, deps.now());
     if (!lock) continue;
     try {
       const repoUrl = resolveRepoUrl({ cwd: t.cwd, projectDirName: t.projectDirName });
-      const out = await syncSession({
+      const attemptSync = () => syncSession({
         sessionPath: t.sessionPath,
         repoUrl,
         hostname: getHostname(),
-        engineUrl: config.engine_url,
+        engineUrl,
         auth: { issuerUrl: config.issuer_url, clientId: config.client_id },
         credentials,
         deps: sessionDeps
       });
+      let out = await attemptSync();
+      if (out.result.kind === "misdirected" && !reResolved) {
+        const placement = await fetchPlacement(
+          config.control_url,
+          out.credentials.access_token,
+          { fetch: deps.fetch }
+        );
+        if (!placement) {
+          await appendLog(
+            `[${basename2(t.sessionPath)}] sync deferred (kept buffer): this tenant is served by another region, and the control plane could not be reached to find out which.`
+          );
+          continue;
+        }
+        reResolved = true;
+        if (placement.dataPlaneBaseUrl !== engineUrl) {
+          await appendLog(
+            `Data plane moved: this tenant is served by ${placement.region}. Switching to ${placement.dataPlaneBaseUrl}.`
+          );
+          engineUrl = placement.dataPlaneBaseUrl;
+          await saveEngineUrl(engineUrl);
+          if (await mirrorEngineUrlToClaudeEnv(engineUrl)) {
+            await appendLog(
+              `Search endpoint updated to ${engineUrl}. Restart Claude Code for search to use it.`
+            );
+          }
+          credentials = out.credentials;
+          out = await attemptSync();
+        }
+      }
       if (out.credentials !== credentials) {
         credentials = out.credentials;
       }
@@ -5133,6 +5288,11 @@ async function runSync(payload, deps = defaultDeps()) {
           break;
         case "outage":
           await appendLog(`[${basename2(t.sessionPath)}] sync deferred (kept buffer): ${r.message}`);
+          break;
+        case "misdirected":
+          await appendLog(
+            `[${basename2(t.sessionPath)}] sync deferred (kept buffer): the control plane says this tenant is served here, but the data plane says it is served by${r.region ? ` the ${r.region} region` : " another region"}. They disagree, so no endpoint will work until that is resolved - this is a platform issue, not a login problem.`
+          );
           break;
         case "nothing":
           break;
@@ -5158,6 +5318,10 @@ async function runSync(payload, deps = defaultDeps()) {
     );
   } else if (cappedReason === "suspended") {
     await appendLog("Workspace suspended - data is buffered and will sync once the workspace is reactivated.");
+  } else if (cappedReason === "migrating") {
+    await appendLog(
+      "Your data is being moved to another region - ingest is paused. Nothing is lost: it is buffered and will sync automatically once the move completes."
+    );
   }
   if (sawNeedsLogin) {
     await appendLog("Session expired. Run `/granthiaai-client:login` in Claude Code again to resume background sync.");
