@@ -32,11 +32,23 @@ function syncLogPath() {
 function refreshLockPath() {
   return join(granthiaaiDir(), "refresh.lock");
 }
+function lastFullScanPath() {
+  return join(granthiaaiDir(), "last-full-scan");
+}
+function fullScanLockPath() {
+  return join(granthiaaiDir(), "full-scan.lock");
+}
+function lastSuccessPath() {
+  return join(granthiaaiDir(), "last-success");
+}
 function cursorPath(sessionPath) {
   return sessionPath + ".granthiaai-cursor";
 }
 function pendingPath(sessionPath) {
   return sessionPath + ".granthiaai-pending";
+}
+function attemptsPath(sessionPath) {
+  return sessionPath + ".granthiaai-attempts";
 }
 function lockPath(sessionPath) {
   return sessionPath + ".granthiaai-lock";
@@ -527,15 +539,134 @@ async function logoutCommand() {
 }
 
 // src/commands/status.ts
-import { readFile as readFile4 } from "fs/promises";
+import { readFile as readFile5 } from "fs/promises";
+
+// src/pending-backlog.ts
+import { readdir, stat } from "fs/promises";
+import { join as join3 } from "path";
+
+// src/give-up.ts
+import { mkdir as mkdir4, readFile as readFile4, rm as rm2, writeFile as writeFile4 } from "fs/promises";
+var GIVE_UP_AFTER_MS = 14 * 24 * 60 * 60 * 1e3;
+async function readAttempts(sessionPath) {
+  try {
+    const raw = JSON.parse(await readFile4(attemptsPath(sessionPath), "utf-8"));
+    if (typeof raw.attempts !== "number") return null;
+    return {
+      attempts: raw.attempts,
+      firstFailedAt: typeof raw.firstFailedAt === "number" ? raw.firstFailedAt : 0,
+      givenUpAt: typeof raw.givenUpAt === "number" ? raw.givenUpAt : null
+    };
+  } catch {
+    return null;
+  }
+}
+async function write(sessionPath, state) {
+  await writeFile4(attemptsPath(sessionPath), JSON.stringify(state), "utf-8");
+}
+async function recordFailedAttempt(sessionPath, now, lastSuccessAt) {
+  const stored = await readAttempts(sessionPath);
+  const revived = stored?.givenUpAt != null && lastSuccessAt !== null && stored.givenUpAt <= lastSuccessAt;
+  const prev = revived ? null : stored;
+  const firstFailedAt = prev?.firstFailedAt ?? now;
+  const expired = now - firstFailedAt >= GIVE_UP_AFTER_MS;
+  const justGaveUp = prev?.givenUpAt == null && expired;
+  await write(sessionPath, {
+    attempts: (prev?.attempts ?? 0) + 1,
+    // diagnostics only; it does not drive give-up
+    firstFailedAt,
+    // Keep the give-up moment for the CURRENT episode once set: it is compared against the
+    // last success, so refreshing it on every later attempt would keep moving it past that
+    // success and the buffer would never come back.
+    givenUpAt: prev?.givenUpAt ?? (expired ? now : null)
+  });
+  return justGaveUp;
+}
+async function clearAttempts(sessionPath) {
+  await rm2(attemptsPath(sessionPath), { force: true });
+}
+async function recordSuccess(now) {
+  await mkdir4(granthiaaiDir(), { recursive: true });
+  await writeFile4(lastSuccessPath(), JSON.stringify({ at: now }), "utf-8");
+}
+async function readLastSuccess() {
+  try {
+    const raw = JSON.parse(await readFile4(lastSuccessPath(), "utf-8"));
+    return typeof raw.at === "number" ? raw.at : null;
+  } catch {
+    return null;
+  }
+}
+function isGivenUp(state, lastSuccessAt) {
+  if (state?.givenUpAt == null) return false;
+  if (lastSuccessAt === null) return true;
+  return state.givenUpAt > lastSuccessAt;
+}
+
+// src/pending-backlog.ts
+var PENDING_SUFFIX = ".granthiaai-pending";
+async function pendingBacklog(excluded) {
+  const empty = () => ({
+    awaiting: { sessions: 0, bytes: 0 },
+    givenUp: { sessions: 0, bytes: 0 }
+  });
+  const root = claudeProjectsDir();
+  let dirs;
+  try {
+    dirs = await readdir(root);
+  } catch {
+    return empty();
+  }
+  const skip = new Set(excluded);
+  const lastSuccessAt = await readLastSuccess();
+  const out = empty();
+  for (const dir of dirs) {
+    let files;
+    try {
+      files = await readdir(join3(root, dir));
+    } catch {
+      continue;
+    }
+    const projectExcluded = skip.has(dir);
+    for (const f of files) {
+      if (!f.endsWith(PENDING_SUFFIX)) continue;
+      const full = join3(root, dir, f);
+      try {
+        const size = (await stat(full)).size;
+        const sessionPath = full.slice(0, -PENDING_SUFFIX.length);
+        const aside = projectExcluded || isGivenUp(await readAttempts(sessionPath), lastSuccessAt);
+        const bucket = aside ? out.givenUp : out.awaiting;
+        bucket.sessions++;
+        bucket.bytes += size;
+      } catch {
+      }
+    }
+  }
+  return out;
+}
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  if (value >= 1023.95 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.4" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.7" : "0.0.0-dev";
 
 // src/commands/status.ts
 async function lastLogLine() {
   try {
-    const lines = (await readFile4(syncLogPath(), "utf-8")).split("\n").filter((l) => l.trim());
+    const lines = (await readFile5(syncLogPath(), "utf-8")).split("\n").filter((l) => l.trim());
     return lines.length ? lines[lines.length - 1] : null;
   } catch {
     return null;
@@ -550,8 +681,22 @@ async function gatherStatus(now = Date.now()) {
     engineUrl: config.engine_url,
     issuerUrl: config.issuer_url,
     version: CLIENT_VERSION,
-    lastSync: await lastLogLine()
+    lastSync: await lastLogLine(),
+    // Same exclusion list the scan honours, so the count only covers work that will
+    // actually be delivered.
+    pending: await pendingBacklog(config.excluded_projects)
   };
+}
+function pendingLine(p) {
+  const parts = [];
+  if (p.awaiting.sessions > 0) {
+    const noun = p.awaiting.sessions === 1 ? "conversation" : "conversations";
+    parts.push(`${p.awaiting.sessions} ${noun} awaiting delivery (${formatBytes(p.awaiting.bytes)})`);
+  }
+  if (p.givenUp.sessions > 0) {
+    parts.push(`${p.givenUp.sessions} set aside (${formatBytes(p.givenUp.bytes)})`);
+  }
+  return parts.length ? parts.join(", ") : "none";
 }
 async function statusCommand() {
   const s = await gatherStatus();
@@ -560,26 +705,27 @@ async function statusCommand() {
   console.log(`  engine:    ${s.engineUrl || "(not configured)"}`);
   console.log(`  issuer:    ${s.issuerUrl || "(not configured)"}`);
   console.log(`  last sync: ${s.lastSync ?? "(no sync log yet)"}`);
+  console.log(`  pending:   ${pendingLine(s.pending)}`);
 }
 
-// src/sync.ts
-import { readdir, readFile as readFile7 } from "fs/promises";
-import { basename as basename2, dirname as dirname3, join as join3 } from "path";
+// src/commands/purge.ts
+import { readdir as readdir2, rm as rm4, stat as stat3 } from "fs/promises";
+import { join as join4 } from "path";
 
 // src/lock.ts
-import { mkdir as mkdir4, open, readFile as readFile5, rm as rm2, stat } from "fs/promises";
+import { mkdir as mkdir5, open, readFile as readFile6, rm as rm3, stat as stat2 } from "fs/promises";
 var STALE_MS = 10 * 60 * 1e3;
 var REFRESH_LOCK_WAIT_MS = 15 * 1e3;
 var REFRESH_LOCK_POLL_MS = 100;
 var REFRESH_LOCK_STALE_MS = 60 * 1e3;
 async function isStale(path, now, staleMs = STALE_MS) {
   try {
-    const data = JSON.parse(await readFile5(path, "utf-8"));
+    const data = JSON.parse(await readFile6(path, "utf-8"));
     if (typeof data.at === "number") return now - data.at > staleMs;
   } catch {
   }
   try {
-    const s = await stat(path);
+    const s = await stat2(path);
     return now - s.mtimeMs > staleMs;
   } catch {
     return true;
@@ -593,7 +739,7 @@ async function tryCreate(path, now) {
     } finally {
       await fh.close();
     }
-    return { release: () => rm2(path, { force: true }) };
+    return { release: () => rm3(path, { force: true }) };
   } catch (err) {
     if (err.code !== "EEXIST") throw err;
     return "exists";
@@ -605,12 +751,24 @@ async function acquireLock(sessionPath, now = Date.now()) {
     const lock = await tryCreate(path, now);
     if (lock !== "exists") return lock;
     if (!await isStale(path, now)) return null;
-    await rm2(path, { force: true });
+    await rm3(path, { force: true });
+  }
+  return null;
+}
+var FULL_SCAN_STALE_MS = 45 * 60 * 1e3;
+async function acquireFullScanLock(now = Date.now()) {
+  await mkdir5(granthiaaiDir(), { recursive: true });
+  const path = fullScanLockPath();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const lock = await tryCreate(path, now);
+    if (lock !== "exists") return lock;
+    if (!await isStale(path, now, FULL_SCAN_STALE_MS)) return null;
+    await rm3(path, { force: true });
   }
   return null;
 }
 async function acquireRefreshLock(deps) {
-  await mkdir4(granthiaaiDir(), { recursive: true });
+  await mkdir5(granthiaaiDir(), { recursive: true });
   const path = refreshLockPath();
   const deadline = deps.now() + REFRESH_LOCK_WAIT_MS;
   for (; ; ) {
@@ -618,13 +776,68 @@ async function acquireRefreshLock(deps) {
     const lock = await tryCreate(path, now);
     if (lock !== "exists") return lock;
     if (await isStale(path, now, REFRESH_LOCK_STALE_MS)) {
-      await rm2(path, { force: true });
+      await rm3(path, { force: true });
       continue;
     }
     if (deps.now() >= deadline) return null;
     await deps.sleep(REFRESH_LOCK_POLL_MS);
   }
 }
+
+// src/commands/purge.ts
+var PENDING_SUFFIX2 = ".granthiaai-pending";
+async function purgeCommand() {
+  const config = await loadConfig();
+  const skip = new Set(config.excluded_projects);
+  const lastSuccessAt = await readLastSuccess();
+  const root = claudeProjectsDir();
+  let dirs;
+  try {
+    dirs = await readdir2(root);
+  } catch {
+    console.log("Nothing to purge: no conversations have been captured on this machine yet.");
+    return;
+  }
+  let removed = 0;
+  let bytes = 0;
+  for (const dir of dirs) {
+    let files;
+    try {
+      files = await readdir2(join4(root, dir));
+    } catch {
+      continue;
+    }
+    const projectExcluded = skip.has(dir);
+    for (const f of files) {
+      if (!f.endsWith(PENDING_SUFFIX2)) continue;
+      const sessionPath = join4(root, dir, f).slice(0, -PENDING_SUFFIX2.length);
+      const aside = projectExcluded || isGivenUp(await readAttempts(sessionPath), lastSuccessAt);
+      if (!aside) continue;
+      const lock = await acquireLock(sessionPath);
+      if (!lock) continue;
+      try {
+        bytes += (await stat3(pendingPath(sessionPath))).size;
+        await rm4(pendingPath(sessionPath), { force: true });
+        await rm4(attemptsPath(sessionPath), { force: true });
+        removed++;
+      } catch {
+      } finally {
+        await lock.release();
+      }
+    }
+  }
+  if (removed === 0) {
+    console.log("Nothing to purge: no conversations have been set aside.");
+    return;
+  }
+  const noun = removed === 1 ? "conversation" : "conversations";
+  console.log(`Purged ${removed} set-aside ${noun} (${formatBytes(bytes)}).`);
+  console.log("Conversations still awaiting delivery were left alone.");
+}
+
+// src/sync.ts
+import { readdir as readdir3, readFile as readFile8 } from "fs/promises";
+import { basename as basename2, dirname as dirname3, join as join5 } from "path";
 
 // src/repo-identity.ts
 import { execFileSync } from "child_process";
@@ -4784,7 +4997,7 @@ function getHostname() {
 }
 
 // src/session-sync.ts
-import { readFile as readFile6, writeFile as writeFile4, rm as rm3 } from "fs/promises";
+import { readFile as readFile7, writeFile as writeFile5, rm as rm5 } from "fs/promises";
 import { basename } from "path";
 
 // src/jsonl-parser.ts
@@ -5009,7 +5222,7 @@ async function refreshUnderLock(auth, used, deps) {
 }
 async function getWatermark(path) {
   try {
-    const raw = await readFile6(path, "utf-8");
+    const raw = await readFile7(path, "utf-8");
     const parts = raw.trim().split(":");
     return { line: parseInt(parts[0] ?? "", 10) || 0, nextTurnIndex: parseInt(parts[1] ?? "", 10) || 0 };
   } catch {
@@ -5018,7 +5231,7 @@ async function getWatermark(path) {
 }
 async function readLinesOrNull(path) {
   try {
-    return (await readFile6(path, "utf-8")).split("\n");
+    return (await readFile7(path, "utf-8")).split("\n");
   } catch {
     return null;
   }
@@ -5048,18 +5261,18 @@ async function syncSession(params) {
   const pendingLines = await readLinesOrNull(pending);
   const delta = pendingLines && weight(sourceDelta) < weight(pendingLines) ? pendingLines : sourceDelta;
   if (weight(delta) === 0) {
-    if (pendingLines) await rm3(pending, { force: true });
-    if (sourceLen !== watermark) await writeFile4(cursor, `${sourceLen}:${nextTurnIndex}`);
+    if (pendingLines) await rm5(pending, { force: true });
+    if (sourceLen !== watermark) await writeFile5(cursor, `${sourceLen}:${nextTurnIndex}`);
     return { result: { kind: "nothing" }, credentials };
   }
   const turns = filterConversationTurns(parseJSONL(delta.join("\n")));
   const chunks = chunkTurns(turns, nextTurnIndex);
   if (chunks.length === 0) {
-    if (pendingLines) await rm3(pending, { force: true });
-    await writeFile4(cursor, `${sourceLen}:${nextTurnIndex}`);
+    if (pendingLines) await rm5(pending, { force: true });
+    await writeFile5(cursor, `${sourceLen}:${nextTurnIndex}`);
     return { result: { kind: "nothing" }, credentials };
   }
-  await writeFile4(pending, delta.map(redactSecrets).join("\n"));
+  await writeFile5(pending, delta.map(redactSecrets).join("\n"));
   const meta = { repo_url: repoUrl, hostname: hostname2, session_id: sessionId };
   const redacted = redactChunks(chunks);
   const send = (accessToken) => postIngest(engineUrl, accessToken, meta, redacted, { fetch: deps.fetch, timeoutMs: deps.timeoutMs });
@@ -5080,8 +5293,8 @@ async function syncSession(params) {
       if (outcome.reason) {
         return { result: { kind: "capped", reason: outcome.reason }, credentials };
       }
-      await rm3(pending, { force: true });
-      await writeFile4(cursor, `${sourceLen}:${nextTurnIndex + chunks.length}`);
+      await rm5(pending, { force: true });
+      await writeFile5(cursor, `${sourceLen}:${nextTurnIndex + chunks.length}`);
       return {
         result: { kind: "synced", synced: outcome.synced, minVersion: outcome.minVersion },
         credentials
@@ -5099,11 +5312,11 @@ async function syncSession(params) {
 }
 
 // src/log.ts
-import { appendFile, mkdir as mkdir5, rename as rename2, rm as rm4, stat as stat2 } from "fs/promises";
+import { appendFile, mkdir as mkdir6, rename as rename2, rm as rm6, stat as stat4 } from "fs/promises";
 var BEARER = /\b[Bb]earer\s+[A-Za-z0-9._-]+/g;
 async function fileSize(path) {
   try {
-    return (await stat2(path)).size;
+    return (await stat4(path)).size;
   } catch {
     return 0;
   }
@@ -5115,10 +5328,10 @@ async function safeRename(from, to) {
   }
 }
 async function maintainLog(cfg, now = Date.now()) {
-  await mkdir5(granthiaaiDir(), { recursive: true });
+  await mkdir6(granthiaaiDir(), { recursive: true });
   const base = syncLogPath();
   if (await fileSize(base) > cfg.max_bytes) {
-    await rm4(`${base}.${cfg.max_rotations}`, { force: true });
+    await rm6(`${base}.${cfg.max_rotations}`, { force: true });
     for (let i = cfg.max_rotations - 1; i >= 1; i--) {
       await safeRename(`${base}.${i}`, `${base}.${i + 1}`);
     }
@@ -5128,13 +5341,13 @@ async function maintainLog(cfg, now = Date.now()) {
   for (let i = 1; i <= cfg.max_rotations; i++) {
     const p = `${base}.${i}`;
     try {
-      if ((await stat2(p)).mtimeMs < cutoff) await rm4(p, { force: true });
+      if ((await stat4(p)).mtimeMs < cutoff) await rm6(p, { force: true });
     } catch {
     }
   }
 }
 async function appendLog(line) {
-  await mkdir5(granthiaaiDir(), { recursive: true });
+  await mkdir6(granthiaaiDir(), { recursive: true });
   const safe = line.replace(BEARER, "Bearer [REDACTED]");
   await appendFile(syncLogPath(), safe.endsWith("\n") ? safe : `${safe}
 `);
@@ -5157,7 +5370,7 @@ function compareVersions(a, b) {
 }
 async function cwdFromSession(sessionPath) {
   try {
-    const raw = await readFile7(sessionPath, "utf-8");
+    const raw = await readFile8(sessionPath, "utf-8");
     for (const line of raw.split("\n")) {
       const t = line.trim();
       if (!t) continue;
@@ -5175,7 +5388,7 @@ async function fullScanTargets(excluded) {
   const root = claudeProjectsDir();
   let dirs;
   try {
-    dirs = await readdir(root);
+    dirs = await readdir3(root);
   } catch {
     return [];
   }
@@ -5183,16 +5396,16 @@ async function fullScanTargets(excluded) {
   const targets = [];
   for (const dir of dirs) {
     if (exclude.has(dir)) continue;
-    const projectDir = join3(root, dir);
+    const projectDir = join5(root, dir);
     let files;
     try {
-      files = await readdir(projectDir);
+      files = await readdir3(projectDir);
     } catch {
       continue;
     }
     for (const f of files) {
       if (!f.endsWith(".jsonl")) continue;
-      const sessionPath = join3(projectDir, f);
+      const sessionPath = join5(projectDir, f);
       targets.push({ sessionPath, cwd: await cwdFromSession(sessionPath), projectDirName: dir });
     }
   }
@@ -5224,11 +5437,19 @@ async function runSync(payload, deps = defaultDeps()) {
   let sawNoTenant = false;
   let cappedReason;
   let engineUrl = config.engine_url;
+  const noteIfGivenUp = async (sessionPath, now) => {
+    if (!await recordFailedAttempt(sessionPath, now, lastSuccessAt)) return;
+    await appendLog(
+      `[${basename2(sessionPath)}] set aside after failing for ${Math.round(GIVE_UP_AFTER_MS / 864e5)} days. The capture is KEPT and will be retried again as soon as any conversation syncs. Run \`granthiaai purge\` to delete it instead.`
+    );
+  };
   let reResolved = false;
+  let lastSuccessAt = await readLastSuccess();
   for (const t of targets) {
     const lock = await acquireLock(t.sessionPath, deps.now());
     if (!lock) continue;
     try {
+      if (isGivenUp(await readAttempts(t.sessionPath), lastSuccessAt)) continue;
       const repoUrl = resolveRepoUrl({ cwd: t.cwd, projectDirName: t.projectDirName });
       const attemptSync = () => syncSession({
         sessionPath: t.sessionPath,
@@ -5276,25 +5497,34 @@ async function runSync(payload, deps = defaultDeps()) {
         case "synced":
           await appendLog(`[${basename2(t.sessionPath)}] synced ${r.synced} chunk(s).`);
           if (r.minVersion) minVersion = r.minVersion;
+          await clearAttempts(t.sessionPath);
+          await recordSuccess(deps.now());
+          lastSuccessAt = deps.now();
           break;
         case "no_tenant":
           sawNoTenant = true;
+          await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "capped":
           cappedReason = r.reason;
+          await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "needs_login":
           sawNeedsLogin = true;
+          await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "outage":
           await appendLog(`[${basename2(t.sessionPath)}] sync deferred (kept buffer): ${r.message}`);
+          await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "misdirected":
           await appendLog(
             `[${basename2(t.sessionPath)}] sync deferred (kept buffer): the control plane says this tenant is served here, but the data plane says it is served by${r.region ? ` the ${r.region} region` : " another region"}. They disagree, so no endpoint will work until that is resolved - this is a platform issue, not a login problem.`
           );
+          await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "nothing":
+          await clearAttempts(t.sessionPath);
           break;
       }
     } finally {
@@ -5328,6 +5558,43 @@ async function runSync(payload, deps = defaultDeps()) {
   }
 }
 
+// src/scheduled-scan.ts
+import { mkdir as mkdir7, readFile as readFile9, writeFile as writeFile6 } from "fs/promises";
+var FULL_SCAN_INTERVAL_MS = 6 * 60 * 60 * 1e3;
+function defaultScheduledScanDeps() {
+  return {
+    now: () => Date.now(),
+    runSync: (payload) => runSync(payload),
+    hasCredentials: async () => await readCredentials() !== null
+  };
+}
+async function readLastScan() {
+  try {
+    const data = JSON.parse(await readFile9(lastFullScanPath(), "utf-8"));
+    return typeof data.at === "number" ? data.at : null;
+  } catch {
+    return null;
+  }
+}
+async function runScheduledScan(deps = defaultScheduledScanDeps()) {
+  try {
+    if (!await deps.hasCredentials()) return;
+    const now = deps.now();
+    const last = await readLastScan();
+    if (last !== null && now >= last && now - last < FULL_SCAN_INTERVAL_MS) return;
+    const lock = await acquireFullScanLock(now);
+    if (!lock) return;
+    try {
+      await mkdir7(granthiaaiDir(), { recursive: true });
+      await writeFile6(lastFullScanPath(), JSON.stringify({ at: now }), "utf-8");
+      await deps.runSync(null);
+    } finally {
+      await lock.release();
+    }
+  } catch {
+  }
+}
+
 // src/index.ts
 var USAGE = `Granthia CLI
 
@@ -5335,7 +5602,8 @@ Usage:
   granthiaai login    Authorize background sync (opens the browser; --headless for device flow)
   granthiaai logout   Remove cached credentials
   granthiaai status   Show login state, engine URL, and last sync
-  granthiaai sync     Sync sessions (Stop hook = targeted; manual = full scan)`;
+  granthiaai sync     Sync sessions (Stop hook = targeted; manual = full scan)
+  granthiaai purge    Delete captures that were set aside as undeliverable`;
 async function readHookPayload() {
   if (process.stdin.isTTY) return null;
   const chunks = [];
@@ -5360,7 +5628,14 @@ async function main() {
     case "status":
       await statusCommand();
       return;
+    case "purge":
+      await purgeCommand();
+      return;
     case "sync": {
+      if (process.argv.includes("--scheduled")) {
+        await runScheduledScan();
+        return;
+      }
       try {
         await runSync(await readHookPayload());
       } catch (err) {
