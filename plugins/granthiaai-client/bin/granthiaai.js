@@ -660,10 +660,86 @@ function formatBytes(bytes) {
   return `${value.toFixed(1)} ${units[unit]}`;
 }
 
+// src/log.ts
+import { appendFile, mkdir as mkdir5, rename as rename2, rm as rm3, stat as stat2 } from "fs/promises";
+var BEARER = /\b[Bb]earer\s+[A-Za-z0-9._-]+/g;
+async function fileSize(path) {
+  try {
+    return (await stat2(path)).size;
+  } catch {
+    return 0;
+  }
+}
+async function safeRename(from, to) {
+  try {
+    await rename2(from, to);
+  } catch {
+  }
+}
+async function maintainLog(cfg, now = Date.now()) {
+  await mkdir5(granthiaaiDir(), { recursive: true });
+  const base = syncLogPath();
+  if (await fileSize(base) > cfg.max_bytes) {
+    await rm3(`${base}.${cfg.max_rotations}`, { force: true });
+    for (let i = cfg.max_rotations - 1; i >= 1; i--) {
+      await safeRename(`${base}.${i}`, `${base}.${i + 1}`);
+    }
+    await safeRename(base, `${base}.1`);
+  }
+  const cutoff = now - cfg.retention_days * 24 * 60 * 60 * 1e3;
+  for (let i = 1; i <= cfg.max_rotations; i++) {
+    const p = `${base}.${i}`;
+    try {
+      if ((await stat2(p)).mtimeMs < cutoff) await rm3(p, { force: true });
+    } catch {
+    }
+  }
+}
+async function appendLog(line, now = /* @__PURE__ */ new Date()) {
+  await mkdir5(granthiaaiDir(), { recursive: true });
+  const safe = line.replace(BEARER, "Bearer [REDACTED]");
+  const stamped = `${now.toISOString()} ${safe}`;
+  await appendFile(syncLogPath(), stamped.endsWith("\n") ? stamped : `${stamped}
+`);
+}
+function logLineTimestamp(line) {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) /.exec(line);
+  if (!match?.[1]) return null;
+  const when = new Date(match[1]);
+  return Number.isNaN(when.getTime()) ? null : when;
+}
+
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.7" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.8" : "0.0.0-dev";
 
 // src/commands/status.ts
+function accountFromToken(accessToken) {
+  try {
+    const payload = accessToken.split(".")[1];
+    if (!payload) return null;
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+    if (typeof claims.email === "string" && claims.email !== "") return claims.email;
+    if (typeof claims.sub === "string" && claims.sub !== "") return claims.sub;
+    return null;
+  } catch {
+    return null;
+  }
+}
+function humanAge(then, now) {
+  const seconds = Math.max(0, Math.round((now - then.getTime()) / 1e3));
+  const units = [
+    [60, "second"],
+    [60, "minute"],
+    [24, "hour"],
+    [Number.POSITIVE_INFINITY, "day"]
+  ];
+  let value = seconds;
+  for (const [size, name] of units) {
+    if (value < size) return value === 1 ? `1 ${name} ago` : `${value} ${name}s ago`;
+    value = Math.floor(value / size);
+  }
+  return "a long time ago";
+}
 async function lastLogLine() {
   try {
     const lines = (await readFile5(syncLogPath(), "utf-8")).split("\n").filter((l) => l.trim());
@@ -678,6 +754,7 @@ async function gatherStatus(now = Date.now()) {
   return {
     loggedIn: creds !== null,
     accessTokenExpired: creds !== null && creds.expires_at <= now,
+    account: creds ? accountFromToken(creds.access_token) : null,
     engineUrl: config.engine_url,
     issuerUrl: config.issuer_url,
     version: CLIENT_VERSION,
@@ -698,22 +775,36 @@ function pendingLine(p) {
   }
   return parts.length ? parts.join(", ") : "none";
 }
+function lastSyncLine(lastSync, now = Date.now()) {
+  if (lastSync === null) return "(no sync log yet)";
+  const when = logLineTimestamp(lastSync);
+  if (when === null) return lastSync;
+  const message = lastSync.slice(when.toISOString().length + 1);
+  const stamp = when.toISOString().replace("T", " ").slice(0, 16);
+  return `${stamp}Z (${humanAge(when, now)}) - ${message}`;
+}
 async function statusCommand() {
   const s = await gatherStatus();
   console.log(`Granthia CLI ${s.version}`);
   console.log(`  logged in: ${s.loggedIn ? s.accessTokenExpired ? "yes (access token expired; will refresh)" : "yes" : "no - run `granthiaai login`"}`);
+  if (s.loggedIn) {
+    console.log(`  account:   ${s.account ?? "(unknown - could not read the stored token)"}`);
+  }
   console.log(`  engine:    ${s.engineUrl || "(not configured)"}`);
   console.log(`  issuer:    ${s.issuerUrl || "(not configured)"}`);
-  console.log(`  last sync: ${s.lastSync ?? "(no sync log yet)"}`);
+  console.log(`  last sync: ${lastSyncLine(s.lastSync)}`);
   console.log(`  pending:   ${pendingLine(s.pending)}`);
+  if (s.loggedIn) {
+    console.log("  note:      searches are attributed separately, to whichever account authorised Claude Code");
+  }
 }
 
 // src/commands/purge.ts
-import { readdir as readdir2, rm as rm4, stat as stat3 } from "fs/promises";
+import { readdir as readdir2, rm as rm5, stat as stat4 } from "fs/promises";
 import { join as join4 } from "path";
 
 // src/lock.ts
-import { mkdir as mkdir5, open, readFile as readFile6, rm as rm3, stat as stat2 } from "fs/promises";
+import { mkdir as mkdir6, open, readFile as readFile6, rm as rm4, stat as stat3 } from "fs/promises";
 var STALE_MS = 10 * 60 * 1e3;
 var REFRESH_LOCK_WAIT_MS = 15 * 1e3;
 var REFRESH_LOCK_POLL_MS = 100;
@@ -725,7 +816,7 @@ async function isStale(path, now, staleMs = STALE_MS) {
   } catch {
   }
   try {
-    const s = await stat2(path);
+    const s = await stat3(path);
     return now - s.mtimeMs > staleMs;
   } catch {
     return true;
@@ -739,7 +830,7 @@ async function tryCreate(path, now) {
     } finally {
       await fh.close();
     }
-    return { release: () => rm3(path, { force: true }) };
+    return { release: () => rm4(path, { force: true }) };
   } catch (err) {
     if (err.code !== "EEXIST") throw err;
     return "exists";
@@ -751,24 +842,24 @@ async function acquireLock(sessionPath, now = Date.now()) {
     const lock = await tryCreate(path, now);
     if (lock !== "exists") return lock;
     if (!await isStale(path, now)) return null;
-    await rm3(path, { force: true });
+    await rm4(path, { force: true });
   }
   return null;
 }
 var FULL_SCAN_STALE_MS = 45 * 60 * 1e3;
 async function acquireFullScanLock(now = Date.now()) {
-  await mkdir5(granthiaaiDir(), { recursive: true });
+  await mkdir6(granthiaaiDir(), { recursive: true });
   const path = fullScanLockPath();
   for (let attempt = 0; attempt < 2; attempt++) {
     const lock = await tryCreate(path, now);
     if (lock !== "exists") return lock;
     if (!await isStale(path, now, FULL_SCAN_STALE_MS)) return null;
-    await rm3(path, { force: true });
+    await rm4(path, { force: true });
   }
   return null;
 }
 async function acquireRefreshLock(deps) {
-  await mkdir5(granthiaaiDir(), { recursive: true });
+  await mkdir6(granthiaaiDir(), { recursive: true });
   const path = refreshLockPath();
   const deadline = deps.now() + REFRESH_LOCK_WAIT_MS;
   for (; ; ) {
@@ -776,7 +867,7 @@ async function acquireRefreshLock(deps) {
     const lock = await tryCreate(path, now);
     if (lock !== "exists") return lock;
     if (await isStale(path, now, REFRESH_LOCK_STALE_MS)) {
-      await rm3(path, { force: true });
+      await rm4(path, { force: true });
       continue;
     }
     if (deps.now() >= deadline) return null;
@@ -816,9 +907,9 @@ async function purgeCommand() {
       const lock = await acquireLock(sessionPath);
       if (!lock) continue;
       try {
-        bytes += (await stat3(pendingPath(sessionPath))).size;
-        await rm4(pendingPath(sessionPath), { force: true });
-        await rm4(attemptsPath(sessionPath), { force: true });
+        bytes += (await stat4(pendingPath(sessionPath))).size;
+        await rm5(pendingPath(sessionPath), { force: true });
+        await rm5(attemptsPath(sessionPath), { force: true });
         removed++;
       } catch {
       } finally {
@@ -4997,7 +5088,7 @@ function getHostname() {
 }
 
 // src/session-sync.ts
-import { readFile as readFile7, writeFile as writeFile5, rm as rm5 } from "fs/promises";
+import { readFile as readFile7, writeFile as writeFile5, rm as rm6 } from "fs/promises";
 import { basename } from "path";
 
 // src/jsonl-parser.ts
@@ -5261,14 +5352,14 @@ async function syncSession(params) {
   const pendingLines = await readLinesOrNull(pending);
   const delta = pendingLines && weight(sourceDelta) < weight(pendingLines) ? pendingLines : sourceDelta;
   if (weight(delta) === 0) {
-    if (pendingLines) await rm5(pending, { force: true });
+    if (pendingLines) await rm6(pending, { force: true });
     if (sourceLen !== watermark) await writeFile5(cursor, `${sourceLen}:${nextTurnIndex}`);
     return { result: { kind: "nothing" }, credentials };
   }
   const turns = filterConversationTurns(parseJSONL(delta.join("\n")));
   const chunks = chunkTurns(turns, nextTurnIndex);
   if (chunks.length === 0) {
-    if (pendingLines) await rm5(pending, { force: true });
+    if (pendingLines) await rm6(pending, { force: true });
     await writeFile5(cursor, `${sourceLen}:${nextTurnIndex}`);
     return { result: { kind: "nothing" }, credentials };
   }
@@ -5293,7 +5384,7 @@ async function syncSession(params) {
       if (outcome.reason) {
         return { result: { kind: "capped", reason: outcome.reason }, credentials };
       }
-      await rm5(pending, { force: true });
+      await rm6(pending, { force: true });
       await writeFile5(cursor, `${sourceLen}:${nextTurnIndex + chunks.length}`);
       return {
         result: { kind: "synced", synced: outcome.synced, minVersion: outcome.minVersion },
@@ -5309,48 +5400,6 @@ async function syncSession(params) {
     case "error":
       return { result: { kind: "outage", message: outcome.message }, credentials };
   }
-}
-
-// src/log.ts
-import { appendFile, mkdir as mkdir6, rename as rename2, rm as rm6, stat as stat4 } from "fs/promises";
-var BEARER = /\b[Bb]earer\s+[A-Za-z0-9._-]+/g;
-async function fileSize(path) {
-  try {
-    return (await stat4(path)).size;
-  } catch {
-    return 0;
-  }
-}
-async function safeRename(from, to) {
-  try {
-    await rename2(from, to);
-  } catch {
-  }
-}
-async function maintainLog(cfg, now = Date.now()) {
-  await mkdir6(granthiaaiDir(), { recursive: true });
-  const base = syncLogPath();
-  if (await fileSize(base) > cfg.max_bytes) {
-    await rm6(`${base}.${cfg.max_rotations}`, { force: true });
-    for (let i = cfg.max_rotations - 1; i >= 1; i--) {
-      await safeRename(`${base}.${i}`, `${base}.${i + 1}`);
-    }
-    await safeRename(base, `${base}.1`);
-  }
-  const cutoff = now - cfg.retention_days * 24 * 60 * 60 * 1e3;
-  for (let i = 1; i <= cfg.max_rotations; i++) {
-    const p = `${base}.${i}`;
-    try {
-      if ((await stat4(p)).mtimeMs < cutoff) await rm6(p, { force: true });
-    } catch {
-    }
-  }
-}
-async function appendLog(line) {
-  await mkdir6(granthiaaiDir(), { recursive: true });
-  const safe = line.replace(BEARER, "Bearer [REDACTED]");
-  await appendFile(syncLogPath(), safe.endsWith("\n") ? safe : `${safe}
-`);
 }
 
 // src/sync.ts
