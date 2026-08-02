@@ -309,6 +309,29 @@ If it does not open, visit this URL to authorize:
   }
 }
 var DEFAULT_BROWSER_TIMEOUT_MS = 5 * 6e4;
+var PROBE_TIMEOUT_MS = 3e3;
+async function defaultProbe(url, fetchImpl) {
+  try {
+    const res = await fetchImpl(url, {
+      method: "HEAD",
+      // MUST NOT follow redirects. A deployment older than this CLI has /cli-login in
+      // neither PUBLIC_PATHS nor PUBLIC_PREFIXES, so middleware answers this unauthenticated
+      // HEAD with a 307 to /login - and Node's fetch defaults to following that, handing
+      // back the sign-in page's own 200. A probe that follows would then report the
+      // BRANDED PAGE reachable on precisely the deployment it exists to detect: the CLI
+      // opens /cli-login, the browser is bounced to the web sign-in page instead, the
+      // loopback listener never sees an authorization code, and login hangs for the full
+      // 5-minute browser timeout before failing. Asking for the raw response instead (and
+      // requiring a genuine 200, not the 307 a redirect produces) is what keeps this a
+      // fallback rather than a hang. Do not "simplify" this back to a plain fetch.
+      redirect: "manual",
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    });
+    return res.status === 200;
+  } catch {
+    return false;
+  }
+}
 async function loginViaBrowser(opts, deps) {
   const endpoints = await discoverEndpoints(opts.issuerUrl, deps.fetch);
   if (!endpoints.authorization_endpoint) {
@@ -319,8 +342,7 @@ async function loginViaBrowser(opts, deps) {
   const scope = opts.scope ?? "openid offline_access";
   const listener = await (deps.listen ?? defaultLoopbackListener)();
   try {
-    const authUrl = new URL(endpoints.authorization_endpoint);
-    authUrl.search = new URLSearchParams({
+    const authParams = new URLSearchParams({
       client_id: opts.clientId,
       redirect_uri: listener.redirectUri,
       response_type: "code",
@@ -328,13 +350,36 @@ async function loginViaBrowser(opts, deps) {
       code_challenge: pkce.challenge,
       code_challenge_method: "S256",
       state
-    }).toString();
+    });
+    const directUrl = new URL(endpoints.authorization_endpoint);
+    directUrl.search = authParams.toString();
+    let target = directUrl.toString();
+    let branded = false;
+    if (opts.controlUrl) {
+      const chooser = new URL("/cli-login", opts.controlUrl);
+      const probe2 = deps.probe ?? ((u) => defaultProbe(u, deps.fetch));
+      let reachable = false;
+      try {
+        reachable = await probe2(chooser.toString());
+      } catch {
+        reachable = false;
+      }
+      if (reachable) {
+        chooser.search = authParams.toString();
+        target = chooser.toString();
+        branded = true;
+      } else {
+        deps.log(
+          `The Granthia sign-in page was not reachable at ${chooser.origin}; using the identity provider's sign-in page instead.`
+        );
+      }
+    }
     deps.log(
-      `A browser window will open to sign in to Granthia.
+      `A browser window will open to ${branded ? "sign in to Granthia" : "sign in"}.
 If it does not open, visit this URL to continue:
-  ${authUrl.toString()}`
+  ${target}`
     );
-    deps.openBrowser?.(authUrl.toString());
+    deps.openBrowser?.(target);
     const code = await listener.waitForCode(state, deps.timeoutMs ?? DEFAULT_BROWSER_TIMEOUT_MS);
     const res = await postForm(deps.fetch, endpoints.token_endpoint, {
       grant_type: "authorization_code",
@@ -501,7 +546,13 @@ async function loginCommand(opts = {}) {
       "issuer_url is not set. Add it to ~/.granthiaai/config.json (your Granthia OIDC issuer URL)."
     );
   }
-  const loginOpts = { issuerUrl: config.issuer_url, clientId: config.client_id };
+  const loginOpts = {
+    issuerUrl: config.issuer_url,
+    clientId: config.client_id,
+    // Opens the BRANDED chooser; falls back to the identity provider's page if unreachable.
+    // Only the browser flow uses it - the device grant has no browser to send anywhere.
+    controlUrl: config.control_url
+  };
   let credentials;
   if (opts.headless) {
     const deps = opts.deviceDeps ?? defaultOAuthDeps();
@@ -710,7 +761,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.8" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.7.10" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
