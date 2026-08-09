@@ -177,7 +177,7 @@ async function mirrorEngineUrlToClaudeEnv(engineUrl) {
 }
 
 // src/credentials.ts
-import { chmod, mkdir as mkdir3, readFile as readFile3, rm, writeFile as writeFile3 } from "fs/promises";
+import { chmod, mkdir as mkdir3, open, readFile as readFile3, rm, writeFile as writeFile3 } from "fs/promises";
 async function readCredentials() {
   try {
     return JSON.parse(await readFile3(credentialsPath(), "utf-8"));
@@ -189,6 +189,23 @@ async function writeCredentials(creds) {
   await mkdir3(granthiaaiDir(), { recursive: true });
   await writeFile3(credentialsPath(), JSON.stringify(creds, null, 2), { mode: 384 });
   await chmod(credentialsPath(), 384);
+}
+async function markRefreshRejected(refusedToken, now) {
+  const current = await readCredentials();
+  if (current === null || current.refresh_token !== refusedToken) return;
+  const marked = JSON.stringify({ ...current, refresh_rejected_at: now }, null, 2);
+  let handle;
+  try {
+    handle = await open(credentialsPath(), "r+");
+  } catch {
+    return;
+  }
+  try {
+    await handle.truncate(0);
+    await handle.write(marked, 0);
+  } finally {
+    await handle.close();
+  }
 }
 async function clearCredentials() {
   await rm(credentialsPath(), { force: true });
@@ -761,7 +778,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.7.10" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.8.1" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
@@ -805,6 +822,7 @@ async function gatherStatus(now = Date.now()) {
   return {
     loggedIn: creds !== null,
     accessTokenExpired: creds !== null && creds.expires_at <= now,
+    sessionExpired: creds?.refresh_rejected_at !== void 0,
     account: creds ? accountFromToken(creds.access_token) : null,
     engineUrl: config.engine_url,
     issuerUrl: config.issuer_url,
@@ -834,10 +852,15 @@ function lastSyncLine(lastSync, now = Date.now()) {
   const stamp = when.toISOString().replace("T", " ").slice(0, 16);
   return `${stamp}Z (${humanAge(when, now)}) - ${message}`;
 }
+function loginLine(s) {
+  if (!s.loggedIn) return "no - run `granthiaai login`";
+  if (s.sessionExpired) return "no - session expired, run `granthiaai login`";
+  return s.accessTokenExpired ? "yes (access token expired; will refresh)" : "yes";
+}
 async function statusCommand() {
   const s = await gatherStatus();
   console.log(`Granthia CLI ${s.version}`);
-  console.log(`  logged in: ${s.loggedIn ? s.accessTokenExpired ? "yes (access token expired; will refresh)" : "yes" : "no - run `granthiaai login`"}`);
+  console.log(`  logged in: ${loginLine(s)}`);
   if (s.loggedIn) {
     console.log(`  account:   ${s.account ?? "(unknown - could not read the stored token)"}`);
   }
@@ -855,7 +878,7 @@ import { readdir as readdir2, rm as rm5, stat as stat4 } from "fs/promises";
 import { join as join4 } from "path";
 
 // src/lock.ts
-import { mkdir as mkdir6, open, readFile as readFile6, rm as rm4, stat as stat3 } from "fs/promises";
+import { mkdir as mkdir6, open as open2, readFile as readFile6, rm as rm4, stat as stat3 } from "fs/promises";
 var STALE_MS = 10 * 60 * 1e3;
 var REFRESH_LOCK_WAIT_MS = 15 * 1e3;
 var REFRESH_LOCK_POLL_MS = 100;
@@ -875,7 +898,7 @@ async function isStale(path, now, staleMs = STALE_MS) {
 }
 async function tryCreate(path, now) {
   try {
-    const fh = await open(path, "wx");
+    const fh = await open2(path, "wx");
     try {
       await fh.write(JSON.stringify({ pid: process.pid, at: now }));
     } finally {
@@ -5345,6 +5368,9 @@ async function postIngest(engineUrl, accessToken, meta, chunks, deps = { fetch: 
 
 // src/session-sync.ts
 var defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function isSessionOver(r) {
+  return r.kind === "rejected" && r.message === "invalid_grant";
+}
 async function refreshUnderLock(auth, used, deps) {
   const lock = await acquireRefreshLock({ now: deps.now, sleep: deps.sleep ?? defaultSleep });
   try {
@@ -5357,6 +5383,7 @@ async function refreshUnderLock(auth, used, deps) {
     }
     const refreshed = await refresh(auth, current.refresh_token, { fetch: deps.fetch, now: deps.now });
     if (refreshed.kind === "ok") await writeCredentials(refreshed.credentials);
+    if (isSessionOver(refreshed)) await markRefreshRejected(current.refresh_token, deps.now());
     return refreshed;
   } finally {
     await lock?.release();
@@ -5425,7 +5452,10 @@ async function syncSession(params) {
       return { result: { kind: "outage", message: refreshed.message }, credentials };
     }
     if (refreshed.kind === "rejected") {
-      return { result: { kind: "needs_login" }, credentials };
+      return {
+        result: { kind: "needs_login", definitive: isSessionOver(refreshed), message: refreshed.message },
+        credentials
+      };
     }
     credentials = refreshed.credentials;
     outcome = await send(credentials.access_token);
@@ -5533,7 +5563,9 @@ async function runSync(payload, deps = defaultDeps()) {
   const sessionDeps = { fetch: deps.fetch, now: deps.now, timeoutMs: deps.timeoutMs };
   let credentials = creds;
   let minVersion;
-  let sawNeedsLogin = false;
+  let sawRefusedRenewal = false;
+  let sawSessionOver = false;
+  let refusedRenewal;
   let sawNoTenant = false;
   let cappedReason;
   let engineUrl = config.engine_url;
@@ -5610,7 +5642,9 @@ async function runSync(payload, deps = defaultDeps()) {
           await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "needs_login":
-          sawNeedsLogin = true;
+          sawRefusedRenewal = true;
+          if (r.definitive) sawSessionOver = true;
+          else refusedRenewal ??= r.message;
           await noteIfGivenUp(t.sessionPath, deps.now());
           break;
         case "outage":
@@ -5630,7 +5664,7 @@ async function runSync(payload, deps = defaultDeps()) {
     } finally {
       await lock.release();
     }
-    if (sawNeedsLogin) break;
+    if (sawRefusedRenewal) break;
   }
   if (minVersion && compareVersions(CLIENT_VERSION, minVersion) < 0) {
     await appendLog(
@@ -5653,8 +5687,10 @@ async function runSync(payload, deps = defaultDeps()) {
       "Your data is being moved to another region - ingest is paused. Nothing is lost: it is buffered and will sync automatically once the move completes."
     );
   }
-  if (sawNeedsLogin) {
+  if (sawSessionOver) {
     await appendLog("Session expired. Run `/granthiaai-client:login` in Claude Code again to resume background sync.");
+  } else if (refusedRenewal) {
+    await appendLog(`Sign-in could not be renewed (${refusedRenewal}) - captures are kept and will be retried.`);
   }
 }
 

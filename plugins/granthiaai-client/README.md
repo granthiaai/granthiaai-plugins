@@ -8,7 +8,9 @@ knowledge base through a remote MCP server.
 
 - **Search** (`search_knowledge`, `search_by_keyword`, `list_projects`): a remote
   MCP server. Claude Code runs its own OAuth on first use - the plugin ships no
-  static credentials.
+  static credentials. The same server also answers `whoami`, which names the
+  account that OAuth authorised, and so the account your searches are attributed
+  to. It is not a search and costs nothing against your search allowance.
 - **Background sync**: a Stop hook runs the bundled `granthiaai` binary after each
   Claude session, syncing the finished session to the engine. Secrets are redacted
   on your machine before anything is sent.
@@ -97,7 +99,8 @@ no separate CLI install needed):
 - `/granthiaai-client:login` - authorize background sync (a browser window opens to sign
   in; `--headless` uses the device flow; tokens stored at `~/.granthiaai/credentials.json`,
   mode 0600).
-- `/granthiaai-client:status` - login state, engine URL, last sync result.
+- `/granthiaai-client:status` - login state, engine URL, last sync result, and both accounts
+  in play: the one background sync uploads as, and the one searches are attributed to.
 - `/granthiaai-client:logout` - remove cached credentials.
 - `/granthiaai-client:sync` - manual full-scan sync (the Stop hook does this automatically,
   targeted at the finished session).
