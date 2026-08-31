@@ -44,8 +44,9 @@ function lastSuccessPath() {
 function cursorPath(sessionPath) {
   return sessionPath + ".granthiaai-cursor";
 }
+var PENDING_SUFFIX = ".granthiaai-pending";
 function pendingPath(sessionPath) {
-  return sessionPath + ".granthiaai-pending";
+  return sessionPath + PENDING_SUFFIX;
 }
 function attemptsPath(sessionPath) {
   return sessionPath + ".granthiaai-attempts";
@@ -650,6 +651,14 @@ async function recordFailedAttempt(sessionPath, now, lastSuccessAt) {
   });
   return justGaveUp;
 }
+async function giveUpNow(sessionPath, now) {
+  const prev = await readAttempts(sessionPath);
+  await write(sessionPath, {
+    attempts: prev?.attempts ?? 0,
+    firstFailedAt: prev?.firstFailedAt ?? now,
+    givenUpAt: prev?.givenUpAt ?? now
+  });
+}
 async function clearAttempts(sessionPath) {
   await rm2(attemptsPath(sessionPath), { force: true });
 }
@@ -672,7 +681,6 @@ function isGivenUp(state, lastSuccessAt) {
 }
 
 // src/pending-backlog.ts
-var PENDING_SUFFIX = ".granthiaai-pending";
 async function pendingBacklog(excluded) {
   const empty = () => ({
     awaiting: { sessions: 0, bytes: 0 },
@@ -778,7 +786,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.8.1" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.8.2" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
@@ -950,7 +958,14 @@ async function acquireRefreshLock(deps) {
 }
 
 // src/commands/purge.ts
-var PENDING_SUFFIX2 = ".granthiaai-pending";
+async function exists(path) {
+  try {
+    await stat4(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function purgeCommand() {
   const config = await loadConfig();
   const skip = new Set(config.excluded_projects);
@@ -974,8 +989,8 @@ async function purgeCommand() {
     }
     const projectExcluded = skip.has(dir);
     for (const f of files) {
-      if (!f.endsWith(PENDING_SUFFIX2)) continue;
-      const sessionPath = join4(root, dir, f).slice(0, -PENDING_SUFFIX2.length);
+      if (!f.endsWith(PENDING_SUFFIX)) continue;
+      const sessionPath = join4(root, dir, f).slice(0, -PENDING_SUFFIX.length);
       const aside = projectExcluded || isGivenUp(await readAttempts(sessionPath), lastSuccessAt);
       if (!aside) continue;
       const lock = await acquireLock(sessionPath);
@@ -984,6 +999,7 @@ async function purgeCommand() {
         bytes += (await stat4(pendingPath(sessionPath))).size;
         await rm5(pendingPath(sessionPath), { force: true });
         await rm5(attemptsPath(sessionPath), { force: true });
+        if (!await exists(sessionPath)) await rm5(cursorPath(sessionPath), { force: true });
         removed++;
       } catch {
       } finally {
@@ -5398,11 +5414,11 @@ async function getWatermark(path) {
     return { line: 0, nextTurnIndex: 0 };
   }
 }
-async function readLinesOrNull(path) {
+async function readLines(path) {
   try {
-    return (await readFile7(path, "utf-8")).split("\n");
-  } catch {
-    return null;
+    return { kind: "read", lines: (await readFile7(path, "utf-8")).split("\n") };
+  } catch (err) {
+    return err.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
   }
 }
 function weight(lines) {
@@ -5424,21 +5440,36 @@ async function syncSession(params) {
   const cursor = cursorPath(sessionPath);
   const pending = pendingPath(sessionPath);
   const { line: watermark, nextTurnIndex } = await getWatermark(cursor);
-  const sourceLines = await readLinesOrNull(sessionPath) ?? [];
+  const source = await readLines(sessionPath);
+  const buffer = await readLines(pending);
+  if (buffer.kind === "unreadable") {
+    return {
+      result: { kind: "outage", message: "session buffer could not be read" },
+      credentials
+    };
+  }
+  const sourceAbsent = source.kind === "absent";
+  const sourceLines = source.kind === "read" ? source.lines : [];
   const sourceLen = sourceLines.length;
   const sourceDelta = watermark < sourceLen ? sourceLines.slice(watermark) : [];
-  const pendingLines = await readLinesOrNull(pending);
+  const pendingLines = buffer.kind === "read" ? buffer.lines : null;
+  const settleCursor = async (turnIndex) => {
+    if (source.kind === "unreadable") return;
+    if (source.kind === "absent") await rm6(cursor, { force: true });
+    else await writeFile5(cursor, `${sourceLen}:${turnIndex}`);
+  };
   const delta = pendingLines && weight(sourceDelta) < weight(pendingLines) ? pendingLines : sourceDelta;
   if (weight(delta) === 0) {
     if (pendingLines) await rm6(pending, { force: true });
-    if (sourceLen !== watermark) await writeFile5(cursor, `${sourceLen}:${nextTurnIndex}`);
+    if (source.kind === "absent" || sourceLen !== watermark) await settleCursor(nextTurnIndex);
     return { result: { kind: "nothing" }, credentials };
   }
   const turns = filterConversationTurns(parseJSONL(delta.join("\n")));
   const chunks = chunkTurns(turns, nextTurnIndex);
   if (chunks.length === 0) {
+    if (sourceAbsent) return { result: { kind: "unchunkable" }, credentials };
     if (pendingLines) await rm6(pending, { force: true });
-    await writeFile5(cursor, `${sourceLen}:${nextTurnIndex}`);
+    await settleCursor(nextTurnIndex);
     return { result: { kind: "nothing" }, credentials };
   }
   await writeFile5(pending, delta.map(redactSecrets).join("\n"));
@@ -5466,7 +5497,7 @@ async function syncSession(params) {
         return { result: { kind: "capped", reason: outcome.reason }, credentials };
       }
       await rm6(pending, { force: true });
-      await writeFile5(cursor, `${sourceLen}:${nextTurnIndex + chunks.length}`);
+      await settleCursor(nextTurnIndex + chunks.length);
       return {
         result: { kind: "synced", synced: outcome.synced, minVersion: outcome.minVersion },
         credentials
@@ -5533,10 +5564,15 @@ async function fullScanTargets(excluded) {
     } catch {
       continue;
     }
+    const sessions = /* @__PURE__ */ new Set();
     for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
+      if (f.endsWith(".jsonl")) sessions.add(f);
+      else if (f.endsWith(PENDING_SUFFIX)) sessions.add(f.slice(0, -PENDING_SUFFIX.length));
+    }
+    for (const f of sessions) {
       const sessionPath = join5(projectDir, f);
-      targets.push({ sessionPath, cwd: await cwdFromSession(sessionPath), projectDirName: dir });
+      const cwd = await cwdFromSession(sessionPath) ?? await cwdFromSession(pendingPath(sessionPath));
+      targets.push({ sessionPath, cwd, projectDirName: dir });
     }
   }
   return targets;
@@ -5659,6 +5695,12 @@ async function runSync(payload, deps = defaultDeps()) {
           break;
         case "nothing":
           await clearAttempts(t.sessionPath);
+          break;
+        case "unchunkable":
+          await appendLog(
+            `[${basename2(t.sessionPath)}] its transcript is gone and the captured buffer holds no complete exchange to send, so nothing can be delivered. The capture is KEPT and set aside - run \`granthiaai purge\` to delete it.`
+          );
+          await giveUpNow(t.sessionPath, deps.now());
           break;
       }
     } finally {
