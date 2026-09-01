@@ -753,6 +753,12 @@ async function safeRename(from, to) {
   }
 }
 async function maintainLog(cfg, now = Date.now()) {
+  try {
+    await maintain(cfg, now);
+  } catch {
+  }
+}
+async function maintain(cfg, now) {
   await mkdir5(granthiaaiDir(), { recursive: true });
   const base = syncLogPath();
   if (await fileSize(base) > cfg.max_bytes) {
@@ -772,11 +778,14 @@ async function maintainLog(cfg, now = Date.now()) {
   }
 }
 async function appendLog(line, now = /* @__PURE__ */ new Date()) {
-  await mkdir5(granthiaaiDir(), { recursive: true });
-  const safe = line.replace(BEARER, "Bearer [REDACTED]");
-  const stamped = `${now.toISOString()} ${safe}`;
-  await appendFile(syncLogPath(), stamped.endsWith("\n") ? stamped : `${stamped}
+  try {
+    await mkdir5(granthiaaiDir(), { recursive: true });
+    const safe = line.replace(BEARER, "Bearer [REDACTED]");
+    const stamped = `${now.toISOString()} ${safe}`;
+    await appendFile(syncLogPath(), stamped.endsWith("\n") ? stamped : `${stamped}
 `);
+  } catch {
+  }
 }
 function logLineTimestamp(line) {
   const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) /.exec(line);
@@ -786,7 +795,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.8.2" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.9.1" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
@@ -5154,6 +5163,50 @@ function canonicalizeRepoUrl(raw) {
   return host + path;
 }
 
+// ../shared/dist/node-runtime.js
+var NODE_PIN = "24.20.0";
+var PLUGIN_DATA_DIR_NAME = "granthiaai-client-granthiaai";
+var RUNTIME_DIR_NAME = "runtime";
+var NODE_ARTIFACTS = {
+  "darwin-arm64": {
+    file: `node-v${NODE_PIN}-darwin-arm64.tar.gz`,
+    sha256: "40e5607e5ecb3db9192723776da2d75d966260fc74a7a9e731c1bd67dda96bc8"
+  },
+  "darwin-x64": {
+    file: `node-v${NODE_PIN}-darwin-x64.tar.gz`,
+    sha256: "9e5b2644cf107befb6aefca676b96d3296bc10138096f022ed378d6233ed81f4"
+  },
+  "linux-arm64": {
+    file: `node-v${NODE_PIN}-linux-arm64.tar.gz`,
+    sha256: "3515603e2487879a39bc75716f1a2affd027500c64ba50e845cf72cb33219013"
+  },
+  "linux-x64": {
+    file: `node-v${NODE_PIN}-linux-x64.tar.gz`,
+    sha256: "855d581f8a4eb1a8117e3426de25fe02770592febcfb31369aee1ffbfee9e8ec"
+  },
+  "win32-x64": {
+    file: `node-v${NODE_PIN}-win-x64.zip`,
+    sha256: "6cac9ffbca8f6a47091e4b5c772e0606049c3871cb67d900c0cedde630e545ba"
+  },
+  // Windows on ARM is a real machine people develop on (Surface, Snapdragon X) and Node
+  // publishes a build for it. Leaving it out did not degrade gracefully: the installer threw
+  // AFTER the plugin was already installed, telling the user their architecture is
+  // unsupported when upstream supports it perfectly well.
+  "win32-arm64": {
+    file: `node-v${NODE_PIN}-win-arm64.zip`,
+    sha256: "31c6799744de8a54601643098040c68c3697e56c94e407d61d0e5fa5f34191d7"
+  }
+};
+function nodeDownloadUrl(artifact) {
+  return `https://nodejs.org/dist/v${NODE_PIN}/${artifact.file}`;
+}
+function nodeArtifactFor(platform2, arch) {
+  return NODE_ARTIFACTS[`${platform2}-${arch}`] ?? null;
+}
+function nodeBinRelativePath(platform2) {
+  return platform2 === "win32" ? "node.exe" : "bin/node";
+}
+
 // src/repo-identity.ts
 var defaultReadRemote = (cwd) => {
   try {
@@ -5613,8 +5666,17 @@ async function runSync(payload, deps = defaultDeps()) {
   };
   let reResolved = false;
   let lastSuccessAt = await readLastSuccess();
+  const unprocessable = [];
+  let firstFailure;
+  let stoppedEarly = false;
   for (const t of targets) {
-    const lock = await acquireLock(t.sessionPath, deps.now());
+    let lock;
+    try {
+      lock = await acquireLock(t.sessionPath, deps.now());
+    } catch {
+      unprocessable.push(basename2(t.sessionPath));
+      continue;
+    }
     if (!lock) continue;
     try {
       if (isGivenUp(await readAttempts(t.sessionPath), lastSuccessAt)) continue;
@@ -5665,9 +5727,9 @@ async function runSync(payload, deps = defaultDeps()) {
         case "synced":
           await appendLog(`[${basename2(t.sessionPath)}] synced ${r.synced} chunk(s).`);
           if (r.minVersion) minVersion = r.minVersion;
-          await clearAttempts(t.sessionPath);
           await recordSuccess(deps.now());
           lastSuccessAt = deps.now();
+          await clearAttempts(t.sessionPath);
           break;
         case "no_tenant":
           sawNoTenant = true;
@@ -5703,14 +5765,29 @@ async function runSync(payload, deps = defaultDeps()) {
           await giveUpNow(t.sessionPath, deps.now());
           break;
       }
+    } catch (err) {
+      unprocessable.push(basename2(t.sessionPath));
+      firstFailure ??= err instanceof Error ? err.message : String(err);
+      stoppedEarly = true;
     } finally {
-      await lock.release();
+      try {
+        await lock.release();
+      } catch {
+      }
     }
+    if (stoppedEarly) break;
     if (sawRefusedRenewal) break;
   }
   if (minVersion && compareVersions(CLIENT_VERSION, minVersion) < 0) {
     await appendLog(
       `A newer Granthia client is required (have ${CLIENT_VERSION}, need ${minVersion}). Update the plugin via /plugin.`
+    );
+  }
+  if (unprocessable.length > 0) {
+    const reason = firstFailure ? ` The first error was: ${firstFailure}.` : "";
+    const stopped = stoppedEarly ? " The scan stopped there rather than moving on, because work that fails partway may already have renewed the sign-in, and reusing a renewed credential would end the session. The remaining conversations are untouched and are tried on the next run." : "";
+    await appendLog(
+      `${unprocessable.length} conversation(s) could not be completed this run (first: ${unprocessable[0]}) - a project folder is missing or unwritable, or the disk is full.${reason} They are NOT counted as failures, so nothing is set aside; clear the cause and they sync on the next run.${stopped}`
     );
   }
   if (sawNoTenant) {
@@ -5773,6 +5850,184 @@ async function runScheduledScan(deps = defaultScheduledScanDeps()) {
   }
 }
 
+// src/runtime.ts
+import { createHash as createHash2 } from "crypto";
+import { mkdir as mkdir8, readdir as readdir4, readFile as readFile10, rename as rename3, rm as rm7, stat as stat5, writeFile as writeFile7 } from "fs/promises";
+import { execFile } from "child_process";
+import { homedir as homedir3 } from "os";
+import { join as join6 } from "path";
+import { promisify } from "util";
+var exec = promisify(execFile);
+var RETRY_AFTER_MS = 6 * 60 * 60 * 1e3;
+var LOCK_STALE_MS = 10 * 60 * 1e3;
+function dataDir() {
+  return join6(homedir3(), ".claude", "plugins", "data", PLUGIN_DATA_DIR_NAME);
+}
+function runtimeDir() {
+  return join6(dataDir(), RUNTIME_DIR_NAME);
+}
+function runtimeNodePath(platform2 = process.platform) {
+  return join6(runtimeDir(), nodeBinRelativePath(platform2));
+}
+function failureMarkerPath() {
+  return join6(dataDir(), "runtime-install-failure.json");
+}
+async function readFailure() {
+  try {
+    const raw = JSON.parse(await readFile10(failureMarkerPath(), "utf-8"));
+    if (typeof raw.at !== "number") return null;
+    if (raw.pin !== NODE_PIN) return null;
+    return { at: raw.at, reason: String(raw.reason ?? ""), permanent: raw.permanent === true, pin: raw.pin };
+  } catch {
+    return null;
+  }
+}
+async function recordFailure(reason, now, permanent = false) {
+  try {
+    await mkdir8(dataDir(), { recursive: true });
+    await writeFile7(failureMarkerPath(), JSON.stringify({ at: now, reason, permanent, pin: NODE_PIN }), "utf-8");
+  } catch {
+  }
+}
+async function isRuntimeInstalled(platform2 = process.platform) {
+  try {
+    const { stdout } = await exec(runtimeNodePath(platform2), ["-v"], { timeout: 1e4 });
+    return stdout.trim() === `v${NODE_PIN}`;
+  } catch {
+    return false;
+  }
+}
+async function defaultExtract(archivePath, intoDir) {
+  if (archivePath.endsWith(".zip")) {
+    await exec(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        "$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath $env:GRANTHIAAI_ZIP -DestinationPath $env:GRANTHIAAI_DEST -Force"
+      ],
+      { env: { ...process.env, GRANTHIAAI_ZIP: archivePath, GRANTHIAAI_DEST: intoDir } }
+    );
+    return;
+  }
+  await exec("tar", ["-xzf", archivePath, "-C", intoDir]);
+}
+async function sweepAbandoned(dir) {
+  try {
+    for (const name of await readdir4(dir)) {
+      const m = /^(?:\.staging|runtime\.old)-(\d+)$/.exec(name);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (pid === process.pid) continue;
+      try {
+        process.kill(pid, 0);
+        continue;
+      } catch {
+      }
+      await rm7(join6(dir, name), { recursive: true, force: true });
+    }
+  } catch {
+  }
+}
+async function acquireLock2(dir, now) {
+  const lock = join6(dir, ".provision-lock");
+  try {
+    await mkdir8(dir, { recursive: true });
+    await mkdir8(lock);
+  } catch {
+    try {
+      const age = now - (await stat5(lock)).mtimeMs;
+      if (age < LOCK_STALE_MS) return null;
+      await rm7(lock, { recursive: true, force: true });
+      await mkdir8(lock);
+    } catch {
+      return null;
+    }
+  }
+  return async () => {
+    await rm7(lock, { recursive: true, force: true }).catch(() => {
+    });
+  };
+}
+async function provisionRuntime(deps = {}) {
+  const platform2 = deps.platform ?? process.platform;
+  const arch = deps.arch ?? process.arch;
+  const fetchFn = deps.fetch ?? globalThis.fetch;
+  const extract = deps.extract ?? defaultExtract;
+  const now = deps.now ?? Date.now;
+  const staging = join6(dataDir(), `.staging-${process.pid}`);
+  try {
+    await sweepAbandoned(dataDir());
+    if (await isRuntimeInstalled(platform2)) {
+      await rm7(failureMarkerPath(), { force: true });
+      return { ok: true, alreadyInstalled: true };
+    }
+    const failure = await readFailure();
+    if (failure?.permanent) return { ok: false, skipped: true, reason: failure.reason };
+    if (failure && now() - failure.at < RETRY_AFTER_MS) {
+      return { ok: false, skipped: true, reason: failure.reason };
+    }
+    const artifact = deps.artifact ?? nodeArtifactFor(platform2, arch);
+    if (!artifact) {
+      const reason = `no pinned runtime for ${platform2}-${arch}`;
+      await recordFailure(reason, now(), true);
+      return { ok: false, reason };
+    }
+    const release = await acquireLock2(dataDir(), now());
+    if (!release) return { ok: false, skipped: true, reason: "another session is installing the runtime" };
+    try {
+      const res = await fetchFn(nodeDownloadUrl(artifact));
+      if (!res.ok) {
+        const reason = `download failed (${res.status})`;
+        await recordFailure(reason, now());
+        return { ok: false, reason };
+      }
+      const bytes = Buffer.from(await res.arrayBuffer());
+      const actual = createHash2("sha256").update(bytes).digest("hex");
+      if (actual !== artifact.sha256) {
+        const reason = `checksum mismatch (expected ${artifact.sha256}, got ${actual})`;
+        await recordFailure(reason, now());
+        return { ok: false, reason };
+      }
+      try {
+        await rm7(staging, { recursive: true, force: true });
+        await mkdir8(staging, { recursive: true });
+        const archivePath = join6(staging, artifact.file);
+        await writeFile7(archivePath, bytes);
+        await extract(archivePath, staging);
+        const unpackedName = artifact.file.replace(/\.(tar\.gz|zip)$/, "");
+        const target = runtimeDir();
+        const retired = `${target}.old-${process.pid}`;
+        await rm7(retired, { recursive: true, force: true });
+        let hadPrevious = false;
+        try {
+          await rename3(target, retired);
+          hadPrevious = true;
+        } catch {
+        }
+        try {
+          await rename3(join6(staging, unpackedName), target);
+        } catch (err) {
+          if (hadPrevious) await rename3(retired, target).catch(() => {
+          });
+          throw err;
+        }
+        await rm7(retired, { recursive: true, force: true });
+        await rm7(failureMarkerPath(), { force: true });
+        return { ok: true };
+      } finally {
+        await rm7(staging, { recursive: true, force: true });
+      }
+    } finally {
+      await release();
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await recordFailure(reason, now());
+    return { ok: false, reason };
+  }
+}
+
 // src/index.ts
 var USAGE = `Granthia CLI
 
@@ -5800,6 +6055,15 @@ async function main() {
     case "login":
       await loginCommand({ headless: process.argv.includes("--headless") });
       return;
+    // Not in USAGE: it is a hook-driven migration step, not something to run by hand. It
+    // puts the pinned runtime in place on installs that already work on a system node, so
+    // that when the hooks are switched to it those installs do not update into a broken
+    // state - auto-update is on by design (hooks/enable-autoupdate.mjs), so they would
+    // otherwise be carried across through no action of their own.
+    case "provision-runtime": {
+      await provisionRuntime();
+      return;
+    }
     case "logout":
       await logoutCommand();
       return;

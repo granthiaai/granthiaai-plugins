@@ -16,6 +16,12 @@
           },
           {
             "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js\" provision-runtime",
+            "timeout": 600,
+            "async": true
+          },
+          {
+            "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js\" sync --scheduled",
             "timeout": 1800,
             "async": true
