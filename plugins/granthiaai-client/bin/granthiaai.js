@@ -795,7 +795,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.9.1" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.9.2" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
@@ -5206,6 +5206,10 @@ function nodeArtifactFor(platform2, arch) {
 function nodeBinRelativePath(platform2) {
   return platform2 === "win32" ? "node.exe" : "bin/node";
 }
+var RUNTIME_INTERPRETER = "node";
+function canonicalInterpreterNeedsLink(platform2) {
+  return platform2 !== "win32";
+}
 
 // src/repo-identity.ts
 var defaultReadRemote = (cwd) => {
@@ -5852,7 +5856,7 @@ async function runScheduledScan(deps = defaultScheduledScanDeps()) {
 
 // src/runtime.ts
 import { createHash as createHash2 } from "crypto";
-import { mkdir as mkdir8, readdir as readdir4, readFile as readFile10, rename as rename3, rm as rm7, stat as stat5, writeFile as writeFile7 } from "fs/promises";
+import { copyFile, mkdir as mkdir8, readdir as readdir4, readFile as readFile10, rename as rename3, rm as rm7, stat as stat5, symlink, writeFile as writeFile7 } from "fs/promises";
 import { execFile } from "child_process";
 import { homedir as homedir3 } from "os";
 import { join as join6 } from "path";
@@ -5868,6 +5872,29 @@ function runtimeDir() {
 }
 function runtimeNodePath(platform2 = process.platform) {
   return join6(runtimeDir(), nodeBinRelativePath(platform2));
+}
+function canonicalNodePath() {
+  return join6(runtimeDir(), RUNTIME_INTERPRETER);
+}
+async function ensureCanonicalName(root, platform2) {
+  if (!canonicalInterpreterNeedsLink(platform2)) return;
+  const canonical = join6(root, RUNTIME_INTERPRETER);
+  const real = join6(root, nodeBinRelativePath(platform2));
+  const staged = `${canonical}.tmp-${process.pid}`;
+  await rm7(staged, { force: true }).catch(() => {
+  });
+  try {
+    await symlink(nodeBinRelativePath(platform2), staged);
+  } catch {
+    await copyFile(real, staged);
+  }
+  try {
+    await rename3(staged, canonical);
+  } catch (err) {
+    await rm7(staged, { force: true }).catch(() => {
+    });
+    throw err;
+  }
 }
 function failureMarkerPath() {
   return join6(dataDir(), "runtime-install-failure.json");
@@ -5889,9 +5916,9 @@ async function recordFailure(reason, now, permanent = false) {
   } catch {
   }
 }
-async function isRuntimeInstalled(platform2 = process.platform) {
+async function isRuntimeInstalled() {
   try {
-    const { stdout } = await exec(runtimeNodePath(platform2), ["-v"], { timeout: 1e4 });
+    const { stdout } = await exec(canonicalNodePath(), ["-v"], { timeout: 1e4 });
     return stdout.trim() === `v${NODE_PIN}`;
   } catch {
     return false;
@@ -5912,10 +5939,10 @@ async function defaultExtract(archivePath, intoDir) {
   }
   await exec("tar", ["-xzf", archivePath, "-C", intoDir]);
 }
-async function sweepAbandoned(dir) {
+async function sweepAbandoned(dir, pattern = /^(?:\.staging|runtime\.old)-(\d+)$/) {
   try {
     for (const name of await readdir4(dir)) {
-      const m = /^(?:\.staging|runtime\.old)-(\d+)$/.exec(name);
+      const m = pattern.exec(name);
       if (!m) continue;
       const pid = Number(m[1]);
       if (pid === process.pid) continue;
@@ -5958,9 +5985,21 @@ async function provisionRuntime(deps = {}) {
   const staging = join6(dataDir(), `.staging-${process.pid}`);
   try {
     await sweepAbandoned(dataDir());
-    if (await isRuntimeInstalled(platform2)) {
+    await sweepAbandoned(runtimeDir(), /^node\.tmp-(\d+)$/);
+    if (await isRuntimeInstalled()) {
       await rm7(failureMarkerPath(), { force: true });
       return { ok: true, alreadyInstalled: true };
+    }
+    try {
+      const { stdout } = await exec(runtimeNodePath(platform2), ["-v"], { timeout: 1e4 });
+      if (stdout.trim() === `v${NODE_PIN}`) {
+        await ensureCanonicalName(runtimeDir(), platform2);
+        if (await isRuntimeInstalled()) {
+          await rm7(failureMarkerPath(), { force: true });
+          return { ok: true, alreadyInstalled: true };
+        }
+      }
+    } catch {
     }
     const failure = await readFailure();
     if (failure?.permanent) return { ok: false, skipped: true, reason: failure.reason };
@@ -5996,6 +6035,7 @@ async function provisionRuntime(deps = {}) {
         await writeFile7(archivePath, bytes);
         await extract(archivePath, staging);
         const unpackedName = artifact.file.replace(/\.(tar\.gz|zip)$/, "");
+        await ensureCanonicalName(join6(staging, unpackedName), platform2);
         const target = runtimeDir();
         const retired = `${target}.old-${process.pid}`;
         await rm7(retired, { recursive: true, force: true });

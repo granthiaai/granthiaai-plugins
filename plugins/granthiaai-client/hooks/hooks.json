@@ -1,16 +1,64 @@
 {
+  "_comment": [
+    "Every hook here runs on the PINNED runtime the client installs, not on whatever `node` is on",
+    "PATH. ${CLAUDE_PLUGIN_DATA}/runtime/node is ONE path that works on all three platforms: it is",
+    "extensionless, and a raw process start on Windows resolves it to node.exe (measured on",
+    "10.0.26200). See RUNTIME_INTERPRETER in @granthiaai/shared for why it sits at the runtime root",
+    "rather than under bin/ - it is a migration decision, not a stylistic one.",
+    "",
+    "EXEC FORM (`command` plus `args`) rather than one shell string, everywhere it is available. No",
+    "shell parses these, so a path containing a space or a quote cannot break them, and - the part",
+    "that matters on Windows - there is no bash-vs-PowerShell question. Claude Code picks the shell",
+    "for a shell-form hook based on whether that machine has Git Bash, so the same string would get",
+    "different interpreters on two Windows boxes.",
+    "",
+    "THE ONE EXCEPTION is provision-runtime, which stays on PATH `node` on purpose. It is the hook",
+    "that CREATES the pinned interpreter; pointing it at that interpreter would be circular, would",
+    "brick every existing install the moment the plugin updated, and could never install a runtime",
+    "on a machine that has none. It is the bootstrap. Safe because the installer is now fatal when",
+    "it cannot provision, so a machine with no Node never reaches a session with no runtime.",
+    "",
+    "It is also the one hook left in SHELL form. Exec form is a raw process start, and on Windows that",
+    "resolves an extensionless name through .com and .exe ONLY - so a node.cmd or node.bat PATH shim,",
+    "which scoop and some corporate installs use, would not start it. Shell form recovers that case",
+    "WHERE POWERSHELL IS THE SHELL. It does NOT recover it under Git Bash, which Claude Code prefers",
+    "when present and whose execvp appends the same .exe/.com and no more - so Windows + Git Bash + a",
+    ".cmd shim remains a machine this hook cannot start on. Shell form is strictly better here and is",
+    "not a complete answer; the complete answer is the installer, which is why it is now fatal.",
+    "Every other hook names an absolute path and so does not care; this one searches PATH, and it is",
+    "the hook that must run for a machine to repair itself at all.",
+    "",
+    "WHICH IS WHY THERE ARE TWO OF THEM. A PATH-`node` bootstrap cannot run on a machine that has no",
+    "Node - and that machine is not hypothetical, it is the one this whole feature exists for. Phase",
+    "1's installer needs no interpreter (curl and tar), so a macOS or Linux developer with no Node",
+    "ran it successfully and has runtime/bin/node with no canonical name. On update, every pinned",
+    "hook here would fail and the PATH bootstrap could never run to repair it: bricked, silently,",
+    "with the developer given no reason to re-run an installer.",
+    "",
+    "The second bootstrap names runtime/bin/node directly, which is exactly what that population",
+    "has. It is not circular, because it is not trying to CREATE a runtime - it repairs one that is",
+    "already there. On Windows that path does not exist (the zip puts node.exe at the runtime root)",
+    "so the hook simply fails to start, which is harmless: Windows needs no repair, its node.exe",
+    "already satisfies the extensionless canonical name. A log line on Windows is a cheap price for",
+    "not bricking every bare POSIX machine."
+  ],
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "node -e \"console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'SessionStart',additionalContext:'Granthia is connected to this workspace. Proactively use the search_knowledge MCP tool to check the team past Claude Code conversations for prior work before solving non-trivial problems, debugging errors, designing features, or answering have-we-done-this questions. Do not wait to be asked.'}}))\"",
+            "command": "${CLAUDE_PLUGIN_DATA}/runtime/node",
+            "args": [
+              "-e",
+              "console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'SessionStart',additionalContext:'Granthia is connected to this workspace. Proactively use the search_knowledge MCP tool to check the team past Claude Code conversations for prior work before solving non-trivial problems, debugging errors, designing features, or answering have-we-done-this questions. Do not wait to be asked.'}}))"
+            ],
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/enable-autoupdate.mjs\"",
+            "command": "${CLAUDE_PLUGIN_DATA}/runtime/node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/enable-autoupdate.mjs"],
             "timeout": 10,
             "async": true
           },
@@ -22,7 +70,15 @@
           },
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js\" sync --scheduled",
+            "command": "${CLAUDE_PLUGIN_DATA}/runtime/bin/node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js", "provision-runtime"],
+            "timeout": 600,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/runtime/node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js", "sync", "--scheduled"],
             "timeout": 1800,
             "async": true
           }
@@ -34,7 +90,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js\" sync",
+            "command": "${CLAUDE_PLUGIN_DATA}/runtime/node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js", "sync"],
             "timeout": 120
           }
         ]

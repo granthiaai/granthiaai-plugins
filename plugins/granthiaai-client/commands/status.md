@@ -1,12 +1,12 @@
 ---
 description: Show Granthia client status - the account you sync as, the account you search as, login state, engine URL, and last sync result.
 disable-model-invocation: true
-allowed-tools: Bash(node:*), mcp__plugin_granthiaai-client_granthiaai__whoami
+allowed-tools: Bash(${CLAUDE_PLUGIN_DATA}/runtime/node:*), mcp__plugin_granthiaai-client_granthiaai__whoami
 ---
 
 Granthia client status (account, login state, engine URL, last sync):
 
-!`node "${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js" status`
+!`"${CLAUDE_PLUGIN_DATA}/runtime/node" "${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js" status`
 
 Present the command output above VERBATIM, inside a code block, exactly as printed -
 every line, in order, with no rewording, no summarising, no omissions and nothing added.
