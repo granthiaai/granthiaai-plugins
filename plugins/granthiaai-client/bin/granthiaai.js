@@ -75,7 +75,8 @@ function envUrl(name) {
 function withDefaults(raw) {
   return {
     engine_url: raw.engine_url ?? envUrl("GRANTHIAAI_ENGINE_URL") ?? DEFAULT_ENGINE_URL,
-    issuer_url: raw.issuer_url ?? envUrl("GRANTHIAAI_ISSUER_URL") ?? DEFAULT_ISSUER_URL,
+    issuer_url: raw.issuer_url ?? envUrl("GRANTHIAAI_ISSUER_URL") ?? raw.learned_issuer_url ?? DEFAULT_ISSUER_URL,
+    issuer_explicit: raw.issuer_url !== void 0 || envUrl("GRANTHIAAI_ISSUER_URL") !== void 0,
     control_url: raw.control_url ?? envUrl("GRANTHIAAI_CONTROL_URL") ?? DEFAULT_CONTROL_URL,
     client_id: raw.client_id ?? DEFAULT_CLIENT_ID,
     excluded_projects: raw.excluded_projects ?? [],
@@ -96,6 +97,14 @@ async function saveEngineUrl(engineUrl) {
   const raw = await readRawConfig();
   if (raw.engine_url === engineUrl) return;
   const next = { ...raw, engine_url: engineUrl };
+  await mkdir(dirname(configPath()), { recursive: true });
+  await writeFile(configPath(), `${JSON.stringify(next, null, 2)}
+`);
+}
+async function saveIssuerUrl(issuerUrl) {
+  const raw = await readRawConfig();
+  if (raw.learned_issuer_url === issuerUrl) return;
+  const next = { ...raw, learned_issuer_url: issuerUrl };
   await mkdir(dirname(configPath()), { recursive: true });
   await writeFile(configPath(), `${JSON.stringify(next, null, 2)}
 `);
@@ -137,6 +146,34 @@ async function probe(baseUrl, deps) {
     return Boolean(res?.ok);
   } catch {
     return false;
+  }
+}
+
+// src/control-config.ts
+async function fetchControlIssuer(controlUrl, deps = { fetch: globalThis.fetch }) {
+  try {
+    const url = `${controlUrl.replace(/\/+$/, "")}/api/cli-config`;
+    const res = await deps.fetch(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      // Bounded, like every other discovery call: this runs before the browser opens, so an
+      // endpoint that accepts the connection and then stalls would otherwise hold up login
+      // for undici's 300s headersTimeout with nothing on screen.
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!res?.ok) return null;
+    const body = await res.json();
+    if (typeof body?.issuer !== "string" || body.issuer.length === 0) return null;
+    let parsed;
+    try {
+      parsed = new URL(body.issuer);
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    return body.issuer;
+  } catch {
+    return null;
   }
 }
 
@@ -230,6 +267,8 @@ async function postForm(fetchFn, url, fields) {
     body: new URLSearchParams(fields).toString()
   });
 }
+var ServiceUnreachableError = class extends Error {
+};
 async function reachableFetch(fetchFn, url, init) {
   try {
     return await fetchFn(url, init);
@@ -241,7 +280,7 @@ async function reachableFetch(fetchFn, url, init) {
     } catch {
       where = url;
     }
-    throw new Error(
+    throw new ServiceUnreachableError(
       `Granthia service not reachable at ${where}` + (code ? ` (${code})` : "") + `. Check engine_url / issuer_url in ~/.granthiaai/config.json (or GRANTHIAAI_ENGINE_URL / GRANTHIAAI_ISSUER_URL), and that the service is up.`
     );
   }
@@ -373,7 +412,8 @@ async function loginViaBrowser(opts, deps) {
     directUrl.search = authParams.toString();
     let target = directUrl.toString();
     let branded = false;
-    if (opts.controlUrl) {
+    const issuersAgree = opts.controlPlaneIssuer === opts.issuerUrl;
+    if (opts.controlUrl && issuersAgree) {
       const chooser = new URL("/cli-login", opts.controlUrl);
       const probe2 = deps.probe ?? ((u) => defaultProbe(u, deps.fetch));
       let reachable = false;
@@ -391,6 +431,21 @@ async function loginViaBrowser(opts, deps) {
           `The Granthia sign-in page was not reachable at ${chooser.origin}; using the identity provider's sign-in page instead.`
         );
       }
+    } else if (opts.controlUrl && opts.controlPlaneIssuer) {
+      deps.log(
+        `The control plane at ${new URL(opts.controlUrl).origin} signs in against ${opts.controlPlaneIssuer}, but this client is configured for ${opts.issuerUrl}; using the identity provider's sign-in page instead. Set control_url and issuer_url to the same environment in ~/.granthiaai/config.json to use the Granthia sign-in page.`
+      );
+    } else if (opts.controlUrl) {
+      let where;
+      try {
+        where = new URL(opts.controlUrl).origin;
+      } catch {
+        where = opts.controlUrl;
+      }
+      if (where === "null") where = opts.controlUrl;
+      deps.log(
+        `Could not confirm which identity provider ${where} signs in against; using the identity provider's sign-in page instead.`
+      );
     }
     deps.log(
       `A browser window will open to ${branded ? "sign in to Granthia" : "sign in"}.
@@ -409,7 +464,7 @@ If it does not open, visit this URL to continue:
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(
-        `token exchange failed (${res.status})${body.error ? `: ${body.error}` : ""}`
+        `token exchange failed (${res.status})${body.error ? `: ${body.error}` : ""} at ${opts.issuerUrl}`
       );
     }
     const token = await res.json();
@@ -564,25 +619,37 @@ async function loginCommand(opts = {}) {
       "issuer_url is not set. Add it to ~/.granthiaai/config.json (your Granthia OIDC issuer URL)."
     );
   }
+  const fetchImpl = opts.deviceDeps?.fetch ?? opts.browserDeps?.fetch ?? globalThis.fetch;
+  const controlPlaneIssuer = config.control_url ? await fetchControlIssuer(config.control_url, { fetch: fetchImpl }) : null;
+  const issuerWasLearned = !config.issuer_explicit && controlPlaneIssuer !== null;
+  const issuerUrl = issuerWasLearned ? controlPlaneIssuer : config.issuer_url;
   const loginOpts = {
-    issuerUrl: config.issuer_url,
+    issuerUrl,
     clientId: config.client_id,
-    // Opens the BRANDED chooser; falls back to the identity provider's page if unreachable.
+    // Opens the BRANDED chooser; falls back to the identity provider's page if unreachable
+    // OR if it belongs to a different deployment than the one we will redeem at.
     // Only the browser flow uses it - the device grant has no browser to send anywhere.
-    controlUrl: config.control_url
+    controlUrl: config.control_url,
+    controlPlaneIssuer
   };
   let credentials;
-  if (opts.headless) {
-    const deps = opts.deviceDeps ?? defaultOAuthDeps();
-    deps.log(`Authorizing background sync against ${config.issuer_url}`);
-    credentials = await login(loginOpts, deps);
-  } else {
-    const deps = opts.browserDeps ?? defaultBrowserDeps();
-    deps.log(`Authorizing background sync against ${config.issuer_url}`);
-    credentials = await loginViaBrowser(loginOpts, deps);
+  try {
+    if (opts.headless) {
+      const deps = opts.deviceDeps ?? defaultOAuthDeps();
+      deps.log(`Authorizing background sync against ${issuerUrl}`);
+      credentials = await login(loginOpts, deps);
+    } else {
+      const deps = opts.browserDeps ?? defaultBrowserDeps();
+      deps.log(`Authorizing background sync against ${issuerUrl}`);
+      credentials = await loginViaBrowser(loginOpts, deps);
+    }
+  } catch (err) {
+    throw explainLearnedIssuer(err, config.control_url, issuerUrl, issuerWasLearned);
   }
   await writeCredentials(credentials);
-  const fetchImpl = opts.deviceDeps?.fetch ?? opts.browserDeps?.fetch ?? globalThis.fetch;
+  if (issuerWasLearned) {
+    await saveIssuerUrl(issuerUrl);
+  }
   const placement = await fetchPlacement(config.control_url, credentials.access_token, {
     fetch: fetchImpl
   });
@@ -599,6 +666,14 @@ async function loginCommand(opts = {}) {
     }
   }
   console.log("Logged in. Background sync is now authorized.");
+}
+function explainLearnedIssuer(err, controlUrl, issuerUrl, issuerWasLearned) {
+  if (!issuerWasLearned || !controlUrl) return err;
+  if (!(err instanceof ServiceUnreachableError)) return err;
+  return new Error(
+    `${err.message}
+The control plane at ${new URL(controlUrl).origin} says it signs in against ${issuerUrl}, and this machine cannot reach it. That address was published by the control plane, not read from your configuration - so point control_url at an environment whose identity provider you can reach, or set issuer_url in ~/.granthiaai/config.json to override it.`
+  );
 }
 
 // src/commands/logout.ts
@@ -795,7 +870,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.9.2" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.9.3" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
