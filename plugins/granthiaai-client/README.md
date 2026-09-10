@@ -105,54 +105,69 @@ no separate CLI install needed):
 - `/granthiaai-client:sync` - manual full-scan sync (the Stop hook does this automatically,
   targeted at the finished session).
 
-### "This command requires approval" when running a command
+### "This command requires approval", or a permission error
 
-Each of these commands runs the plugin's bundled binary through Node, and Claude Code asks
-before running any shell command it has not been told to trust. **Approve it and the command
-runs normally** - that is the expected first-run experience, not a fault.
+Each command runs the plugin's **own pinned Node**, by absolute path - not whatever `node`
+happens to be on your PATH:
 
-Approving is also the safest answer, and you will rarely be asked: `login` is a one-time
-step, and background sync never goes through these commands at all - the Stop hook invokes
-the binary directly.
+```
+"~/.claude/plugins/data/granthiaai-client-granthiaai/runtime/node" \
+  "~/.claude/plugins/cache/granthiaai/granthiaai-client/<version>/bin/granthiaai.js" login
+```
 
-If you would rather not be asked, allow it in your own settings (`~/.claude/settings.json`
-for every project, or `.claude/settings.json` for one):
+Each command pre-authorises exactly that call with
+`allowed-tools: Bash(${CLAUDE_PLUGIN_DATA}/runtime/node:*)`, so on a current Claude Code you
+should not be asked at all. If you are asked, **approve it** - that is the expected first-run
+experience, not a fault, and you will rarely see it: `login` is a one-time step, and background
+sync never goes through these commands at all (the Stop hook invokes the binary directly).
+
+**If instead the command FAILS**, with something like:
+
+```
+Shell command permission check failed for pattern "...": This command requires approval
+```
+
+then there is no prompt to accept - Claude Code throws rather than asking. **Your Claude Code is
+too old.** Below **2.1.236** it substitutes `${CLAUDE_PLUGIN_DATA}` in the command's body but not
+in the `allowed-tools` frontmatter, so the rule stays a literal that can never match a real path.
+The fix is to upgrade:
+
+```
+claude update
+```
+
+That works whatever the install method. If it reports being managed by a package manager, use
+that instead (`brew upgrade --cask claude-code`, `winget upgrade Anthropic.ClaudeCode`). The
+platform install scripts refuse to install below 2.1.236 for this reason; the manual
+`/plugin install` route does not check, so this is the failure it produces.
+
+**If you would rather never be asked**, allow it in your own settings
+(`~/.claude/settings.json` for every project, or `.claude/settings.json` for one). The rule has
+to match the **absolute runtime path**, because that is what the command actually starts with:
 
 ```json
 {
   "permissions": {
-    "allow": ["Bash(node:*)"]
+    "allow": ["Bash(*granthiaai-client-granthiaai/runtime/node*)"]
   }
 }
 ```
 
-**Understand what that grants before you paste it:** it trusts *any* command starting with
-`node` in that scope from then on, including `node -e "<code>"`. It is not scoped to this
-plugin.
+`*` matches at any position, so the plugin version in the path does not have to be spelled out
+and the rule survives updates. **`Bash(node:*)` will not work** - the command does not start with
+`node`, and that advice was correct only before the plugin moved to a pinned runtime.
 
-A narrower rule that still survives plugin updates - Claude Code matches `*` at any position,
-so the version in the path does not have to be spelled out:
+Treat the rule as narrower, not as a security boundary: Claude Code's own documentation warns
+that Bash rules constraining arguments are fragile. Note also that a rule in a project's
+`.claude/settings.json` is **ignored until the workspace is trusted** - Claude Code says so when
+it skips one.
 
-```json
-{
-  "permissions": {
-    "allow": ["Bash(node *granthiaai-client/*/bin/granthiaai.js*)"]
-  }
-}
-```
-
-Treat that as narrower, not as a security boundary: Claude Code's own documentation warns
-that Bash rules constraining arguments are fragile.
-
-The commands also declare `allowed-tools: Bash(node:*)` themselves, which is the documented
-way for a command to pre-authorize its own shell call. If you are prompted anyway, the
-settings entry above is the reliable route.
-
-To skip Claude Code entirely, run the binary in a terminal - the path is the one named in
-the approval prompt:
+To skip Claude Code entirely, run the binary in a terminal - the path is the one named in the
+approval prompt:
 
 ```
-node ~/.claude/plugins/cache/granthiaai/granthiaai-client/<version>/bin/granthiaai.js login
+~/.claude/plugins/data/granthiaai-client-granthiaai/runtime/node \
+  ~/.claude/plugins/cache/granthiaai/granthiaai-client/<version>/bin/granthiaai.js login
 ```
 
 ## Notes

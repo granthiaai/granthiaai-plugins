@@ -813,6 +813,8 @@ function formatBytes(bytes) {
 
 // src/log.ts
 import { appendFile, mkdir as mkdir5, rename as rename2, rm as rm3, stat as stat2 } from "fs/promises";
+var NOT_LOGGED_IN_LOG = "Not logged in. Run `/granthiaai-client:login` in Claude Code to authorize background sync.";
+var SESSION_EXPIRED_LOG = "Session expired. Run `/granthiaai-client:login` in Claude Code again to resume background sync.";
 var BEARER = /\b[Bb]earer\s+[A-Za-z0-9._-]+/g;
 async function fileSize(path) {
   try {
@@ -870,7 +872,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.9.3" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.9.4" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
@@ -903,7 +905,7 @@ function humanAge(then, now) {
 async function lastLogLine() {
   try {
     const lines = (await readFile5(syncLogPath(), "utf-8")).split("\n").filter((l) => l.trim());
-    return lines.length ? lines[lines.length - 1] : null;
+    return lines.length ? lines[lines.length - 1].trim() : null;
   } catch {
     return null;
   }
@@ -936,13 +938,15 @@ function pendingLine(p) {
   }
   return parts.length ? parts.join(", ") : "none";
 }
-function lastSyncLine(lastSync, now = Date.now()) {
+function lastSyncLine(lastSync, signedIn, now = Date.now()) {
   if (lastSync === null) return "(no sync log yet)";
   const when = logLineTimestamp(lastSync);
-  if (when === null) return lastSync;
-  const message = lastSync.slice(when.toISOString().length + 1);
+  const message = when === null ? lastSync : lastSync.slice(when.toISOString().length + 1);
+  const superseded = signedIn && (message === NOT_LOGGED_IN_LOG || message === SESSION_EXPIRED_LOG);
+  const tail = superseded ? " (superseded by the current sign-in)" : "";
+  if (when === null) return `${lastSync}${tail}`;
   const stamp = when.toISOString().replace("T", " ").slice(0, 16);
-  return `${stamp}Z (${humanAge(when, now)}) - ${message}`;
+  return `${stamp}Z (${humanAge(when, now)}) - ${message}${tail}`;
 }
 function loginLine(s) {
   if (!s.loggedIn) return "no - run `granthiaai login`";
@@ -958,7 +962,7 @@ async function statusCommand() {
   }
   console.log(`  engine:    ${s.engineUrl || "(not configured)"}`);
   console.log(`  issuer:    ${s.issuerUrl || "(not configured)"}`);
-  console.log(`  last sync: ${lastSyncLine(s.lastSync)}`);
+  console.log(`  last sync: ${lastSyncLine(s.lastSync, s.loggedIn && !s.sessionExpired)}`);
   console.log(`  pending:   ${pendingLine(s.pending)}`);
   if (s.loggedIn) {
     console.log("  note:      searches are attributed separately, to whichever account authorised Claude Code");
@@ -5714,7 +5718,7 @@ async function runSync(payload, deps = defaultDeps()) {
   await maintainLog(config.log, deps.now());
   const creds = await readCredentials();
   if (!creds) {
-    await appendLog("Not logged in. Run `/granthiaai-client:login` in Claude Code to authorize background sync.");
+    await appendLog(NOT_LOGGED_IN_LOG);
     return;
   }
   if (!config.engine_url || !config.issuer_url) {
@@ -5886,7 +5890,7 @@ async function runSync(payload, deps = defaultDeps()) {
     );
   }
   if (sawSessionOver) {
-    await appendLog("Session expired. Run `/granthiaai-client:login` in Claude Code again to resume background sync.");
+    await appendLog(SESSION_EXPIRED_LOG);
   } else if (refusedRenewal) {
     await appendLog(`Sign-in could not be renewed (${refusedRenewal}) - captures are kept and will be retried.`);
   }
