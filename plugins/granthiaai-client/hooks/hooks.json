@@ -40,6 +40,17 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/runtime/node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/granthiaai.js", "session-notice"],
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [

@@ -872,7 +872,7 @@ function logLineTimestamp(line) {
 }
 
 // src/version.ts
-var CLIENT_VERSION = true ? "2026.9.4" : "0.0.0-dev";
+var CLIENT_VERSION = true ? "2026.9.5" : "0.0.0-dev";
 
 // src/commands/status.ts
 function accountFromToken(accessToken) {
@@ -1104,9 +1104,200 @@ async function purgeCommand() {
   console.log("Conversations still awaiting delivery were left alone.");
 }
 
+// src/session-notice.ts
+import { readdir as readdir3, readFile as readFile7 } from "fs/promises";
+import { join as join5 } from "path";
+
+// src/jsonl-parser.ts
+function parseJSONL(raw) {
+  const results = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      results.push(JSON.parse(trimmed));
+    } catch {
+    }
+  }
+  return results;
+}
+function renderToolResult(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(
+      (b) => typeof b === "string" ? b : typeof b?.text === "string" ? b.text : ""
+    ).filter(Boolean).join("\n");
+  }
+  return "";
+}
+function renderContent(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) return null;
+  const parts = [];
+  for (const block of content) {
+    switch (block.type) {
+      case "text":
+        if (block.text) parts.push(block.text);
+        break;
+      case "thinking":
+        if (block.thinking) parts.push(block.thinking);
+        break;
+      case "tool_use":
+        parts.push(
+          `[tool: ${block.name ?? "unknown"}] ${JSON.stringify(
+            block.input ?? {}
+          )}`
+        );
+        break;
+      case "tool_result": {
+        const rendered = renderToolResult(block.content);
+        if (rendered) parts.push(rendered);
+        break;
+      }
+    }
+  }
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+function isToolResultLine(content) {
+  return Array.isArray(content) && content.some((b) => b.type === "tool_result");
+}
+function filterConversationTurns(lines) {
+  const turns = [];
+  for (const line of lines) {
+    if (line.type !== "user" && line.type !== "assistant") continue;
+    if (line.isMeta) continue;
+    if (!line.message?.role || !line.message?.content) continue;
+    const content = renderContent(line.message.content);
+    if (!content) continue;
+    const role = line.message.role === "user" && !isToolResultLine(line.message.content) ? "user" : "assistant";
+    turns.push({
+      role,
+      content,
+      timestamp: line.timestamp ?? (/* @__PURE__ */ new Date()).toISOString()
+    });
+  }
+  return turns;
+}
+
+// src/session-notice.ts
+var NOTICE_SIGNED_OUT = "Granthia is signed out on this machine, so your Claude Code conversations are not being captured.";
+var NOTICE_EXPIRED = "Your Granthia sign-in on this machine has expired, so your Claude Code conversations are not being captured.";
+var NOTICE_ACTION = "Run /granthiaai-client:login to resume capture.";
+var COUNT_BUDGET_MS = 1500;
+function refreshExpiryMs(refreshToken) {
+  try {
+    const payload = refreshToken.split(".")[1];
+    if (!payload) return null;
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+    return typeof claims.exp === "number" && claims.exp > 0 ? claims.exp * 1e3 : null;
+  } catch {
+    return null;
+  }
+}
+function signInState(creds, now) {
+  if (!creds) return "signed-out";
+  if (creds.refresh_rejected_at !== void 0) return "expired";
+  const expiry = refreshExpiryMs(creds.refresh_token);
+  return expiry !== null && expiry <= now ? "expired" : "signed-in";
+}
+async function hasUnsentTurn(path, uploaded) {
+  let lines;
+  try {
+    lines = (await readFile7(path, "utf-8")).split("\n");
+  } catch {
+    return false;
+  }
+  for (const line of lines.slice(uploaded)) {
+    const entries = parseJSONL(line);
+    if (entries.length > 0 && filterConversationTurns(entries).length > 0) return true;
+  }
+  return false;
+}
+async function uploadedLines(sessionPath) {
+  try {
+    return parseInt((await readFile7(cursorPath(sessionPath), "utf-8")).split(":")[0] ?? "", 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+async function countWaiting(excluded, deadline) {
+  const root = claudeProjectsDir();
+  let dirs;
+  try {
+    dirs = await readdir3(root);
+  } catch {
+    return 0;
+  }
+  const skip = new Set(excluded);
+  let waiting = 0;
+  for (const dir of dirs) {
+    if (skip.has(dir)) continue;
+    if (Date.now() >= deadline) return null;
+    let files;
+    try {
+      files = await readdir3(join5(root, dir));
+    } catch {
+      continue;
+    }
+    const buffered = /* @__PURE__ */ new Set();
+    const transcripts = /* @__PURE__ */ new Set();
+    for (const f of files) {
+      if (f.endsWith(PENDING_SUFFIX)) buffered.add(f.slice(0, -PENDING_SUFFIX.length));
+      else if (f.endsWith(".jsonl")) transcripts.add(f);
+    }
+    waiting += buffered.size;
+    for (const f of transcripts) {
+      if (buffered.has(f)) continue;
+      if (Date.now() >= deadline) return null;
+      const path = join5(root, dir, f);
+      if (await hasUnsentTurn(path, await uploadedLines(path))) waiting++;
+    }
+  }
+  return waiting;
+}
+async function excludedProjects() {
+  try {
+    return (await loadConfig()).excluded_projects;
+  } catch {
+    return [];
+  }
+}
+function waitingSentence(n) {
+  return n === 1 ? "1 conversation is waiting on this machine and will be lost if it is wiped before you sign in." : `${n} conversations are waiting on this machine and will be lost if it is wiped before you sign in.`;
+}
+async function buildSessionNotice(opts = {}) {
+  const now = opts.now ?? Date.now();
+  const state = signInState(await readCredentials(), now);
+  if (state === "signed-in") return null;
+  let waiting;
+  try {
+    waiting = await countWaiting(await excludedProjects(), Date.now() + (opts.budgetMs ?? COUNT_BUDGET_MS));
+  } catch {
+    waiting = null;
+  }
+  const parts = [state === "expired" ? NOTICE_EXPIRED : NOTICE_SIGNED_OUT];
+  if (waiting) parts.push(waitingSentence(waiting));
+  parts.push(NOTICE_ACTION);
+  return parts.join(" ");
+}
+async function sessionNoticeCommand(opts = {}) {
+  const write2 = opts.write ?? ((s) => void process.stdout.write(s));
+  const build = opts.build ?? buildSessionNotice;
+  let message;
+  try {
+    message = await build({ now: opts.now });
+  } catch {
+    return;
+  }
+  if (message) write2(`${JSON.stringify({ systemMessage: message })}
+`);
+}
+
 // src/sync.ts
-import { readdir as readdir3, readFile as readFile8 } from "fs/promises";
-import { basename as basename2, dirname as dirname3, join as join5 } from "path";
+import { readdir as readdir4, readFile as readFile9 } from "fs/promises";
+import { basename as basename2, dirname as dirname3, join as join6 } from "path";
 
 // src/repo-identity.ts
 import { execFileSync } from "child_process";
@@ -5314,81 +5505,8 @@ function getHostname() {
 }
 
 // src/session-sync.ts
-import { readFile as readFile7, writeFile as writeFile5, rm as rm6 } from "fs/promises";
+import { readFile as readFile8, writeFile as writeFile5, rm as rm6 } from "fs/promises";
 import { basename } from "path";
-
-// src/jsonl-parser.ts
-function parseJSONL(raw) {
-  const results = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      results.push(JSON.parse(trimmed));
-    } catch {
-    }
-  }
-  return results;
-}
-function renderToolResult(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map(
-      (b) => typeof b === "string" ? b : typeof b?.text === "string" ? b.text : ""
-    ).filter(Boolean).join("\n");
-  }
-  return "";
-}
-function renderContent(content) {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (!Array.isArray(content)) return null;
-  const parts = [];
-  for (const block of content) {
-    switch (block.type) {
-      case "text":
-        if (block.text) parts.push(block.text);
-        break;
-      case "thinking":
-        if (block.thinking) parts.push(block.thinking);
-        break;
-      case "tool_use":
-        parts.push(
-          `[tool: ${block.name ?? "unknown"}] ${JSON.stringify(
-            block.input ?? {}
-          )}`
-        );
-        break;
-      case "tool_result": {
-        const rendered = renderToolResult(block.content);
-        if (rendered) parts.push(rendered);
-        break;
-      }
-    }
-  }
-  return parts.length > 0 ? parts.join("\n") : null;
-}
-function isToolResultLine(content) {
-  return Array.isArray(content) && content.some((b) => b.type === "tool_result");
-}
-function filterConversationTurns(lines) {
-  const turns = [];
-  for (const line of lines) {
-    if (line.type !== "user" && line.type !== "assistant") continue;
-    if (line.isMeta) continue;
-    if (!line.message?.role || !line.message?.content) continue;
-    const content = renderContent(line.message.content);
-    if (!content) continue;
-    const role = line.message.role === "user" && !isToolResultLine(line.message.content) ? "user" : "assistant";
-    turns.push({
-      role,
-      content,
-      timestamp: line.timestamp ?? (/* @__PURE__ */ new Date()).toISOString()
-    });
-  }
-  return turns;
-}
 
 // src/chunker.ts
 var MIN_ASSISTANT_CONTENT_LENGTH = 30;
@@ -5543,7 +5661,7 @@ async function refreshUnderLock(auth, used, deps) {
 }
 async function getWatermark(path) {
   try {
-    const raw = await readFile7(path, "utf-8");
+    const raw = await readFile8(path, "utf-8");
     const parts = raw.trim().split(":");
     return { line: parseInt(parts[0] ?? "", 10) || 0, nextTurnIndex: parseInt(parts[1] ?? "", 10) || 0 };
   } catch {
@@ -5552,7 +5670,7 @@ async function getWatermark(path) {
 }
 async function readLines(path) {
   try {
-    return { kind: "read", lines: (await readFile7(path, "utf-8")).split("\n") };
+    return { kind: "read", lines: (await readFile8(path, "utf-8")).split("\n") };
   } catch (err) {
     return err.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
   }
@@ -5667,7 +5785,7 @@ function compareVersions(a, b) {
 }
 async function cwdFromSession(sessionPath) {
   try {
-    const raw = await readFile8(sessionPath, "utf-8");
+    const raw = await readFile9(sessionPath, "utf-8");
     for (const line of raw.split("\n")) {
       const t = line.trim();
       if (!t) continue;
@@ -5685,7 +5803,7 @@ async function fullScanTargets(excluded) {
   const root = claudeProjectsDir();
   let dirs;
   try {
-    dirs = await readdir3(root);
+    dirs = await readdir4(root);
   } catch {
     return [];
   }
@@ -5693,10 +5811,10 @@ async function fullScanTargets(excluded) {
   const targets = [];
   for (const dir of dirs) {
     if (exclude.has(dir)) continue;
-    const projectDir = join5(root, dir);
+    const projectDir = join6(root, dir);
     let files;
     try {
-      files = await readdir3(projectDir);
+      files = await readdir4(projectDir);
     } catch {
       continue;
     }
@@ -5706,7 +5824,7 @@ async function fullScanTargets(excluded) {
       else if (f.endsWith(PENDING_SUFFIX)) sessions.add(f.slice(0, -PENDING_SUFFIX.length));
     }
     for (const f of sessions) {
-      const sessionPath = join5(projectDir, f);
+      const sessionPath = join6(projectDir, f);
       const cwd = await cwdFromSession(sessionPath) ?? await cwdFromSession(pendingPath(sessionPath));
       targets.push({ sessionPath, cwd, projectDirName: dir });
     }
@@ -5897,7 +6015,7 @@ async function runSync(payload, deps = defaultDeps()) {
 }
 
 // src/scheduled-scan.ts
-import { mkdir as mkdir7, readFile as readFile9, writeFile as writeFile6 } from "fs/promises";
+import { mkdir as mkdir7, readFile as readFile10, writeFile as writeFile6 } from "fs/promises";
 var FULL_SCAN_INTERVAL_MS = 6 * 60 * 60 * 1e3;
 function defaultScheduledScanDeps() {
   return {
@@ -5908,7 +6026,7 @@ function defaultScheduledScanDeps() {
 }
 async function readLastScan() {
   try {
-    const data = JSON.parse(await readFile9(lastFullScanPath(), "utf-8"));
+    const data = JSON.parse(await readFile10(lastFullScanPath(), "utf-8"));
     return typeof data.at === "number" ? data.at : null;
   } catch {
     return null;
@@ -5935,30 +6053,30 @@ async function runScheduledScan(deps = defaultScheduledScanDeps()) {
 
 // src/runtime.ts
 import { createHash as createHash2 } from "crypto";
-import { copyFile, mkdir as mkdir8, readdir as readdir4, readFile as readFile10, rename as rename3, rm as rm7, stat as stat5, symlink, writeFile as writeFile7 } from "fs/promises";
+import { copyFile, mkdir as mkdir8, readdir as readdir5, readFile as readFile11, rename as rename3, rm as rm7, stat as stat5, symlink, writeFile as writeFile7 } from "fs/promises";
 import { execFile } from "child_process";
 import { homedir as homedir3 } from "os";
-import { join as join6 } from "path";
+import { join as join7 } from "path";
 import { promisify } from "util";
 var exec = promisify(execFile);
 var RETRY_AFTER_MS = 6 * 60 * 60 * 1e3;
 var LOCK_STALE_MS = 10 * 60 * 1e3;
 function dataDir() {
-  return join6(homedir3(), ".claude", "plugins", "data", PLUGIN_DATA_DIR_NAME);
+  return join7(homedir3(), ".claude", "plugins", "data", PLUGIN_DATA_DIR_NAME);
 }
 function runtimeDir() {
-  return join6(dataDir(), RUNTIME_DIR_NAME);
+  return join7(dataDir(), RUNTIME_DIR_NAME);
 }
 function runtimeNodePath(platform2 = process.platform) {
-  return join6(runtimeDir(), nodeBinRelativePath(platform2));
+  return join7(runtimeDir(), nodeBinRelativePath(platform2));
 }
 function canonicalNodePath() {
-  return join6(runtimeDir(), RUNTIME_INTERPRETER);
+  return join7(runtimeDir(), RUNTIME_INTERPRETER);
 }
 async function ensureCanonicalName(root, platform2) {
   if (!canonicalInterpreterNeedsLink(platform2)) return;
-  const canonical = join6(root, RUNTIME_INTERPRETER);
-  const real = join6(root, nodeBinRelativePath(platform2));
+  const canonical = join7(root, RUNTIME_INTERPRETER);
+  const real = join7(root, nodeBinRelativePath(platform2));
   const staged = `${canonical}.tmp-${process.pid}`;
   await rm7(staged, { force: true }).catch(() => {
   });
@@ -5976,11 +6094,11 @@ async function ensureCanonicalName(root, platform2) {
   }
 }
 function failureMarkerPath() {
-  return join6(dataDir(), "runtime-install-failure.json");
+  return join7(dataDir(), "runtime-install-failure.json");
 }
 async function readFailure() {
   try {
-    const raw = JSON.parse(await readFile10(failureMarkerPath(), "utf-8"));
+    const raw = JSON.parse(await readFile11(failureMarkerPath(), "utf-8"));
     if (typeof raw.at !== "number") return null;
     if (raw.pin !== NODE_PIN) return null;
     return { at: raw.at, reason: String(raw.reason ?? ""), permanent: raw.permanent === true, pin: raw.pin };
@@ -6020,7 +6138,7 @@ async function defaultExtract(archivePath, intoDir) {
 }
 async function sweepAbandoned(dir, pattern = /^(?:\.staging|runtime\.old)-(\d+)$/) {
   try {
-    for (const name of await readdir4(dir)) {
+    for (const name of await readdir5(dir)) {
       const m = pattern.exec(name);
       if (!m) continue;
       const pid = Number(m[1]);
@@ -6030,13 +6148,13 @@ async function sweepAbandoned(dir, pattern = /^(?:\.staging|runtime\.old)-(\d+)$
         continue;
       } catch {
       }
-      await rm7(join6(dir, name), { recursive: true, force: true });
+      await rm7(join7(dir, name), { recursive: true, force: true });
     }
   } catch {
   }
 }
 async function acquireLock2(dir, now) {
-  const lock = join6(dir, ".provision-lock");
+  const lock = join7(dir, ".provision-lock");
   try {
     await mkdir8(dir, { recursive: true });
     await mkdir8(lock);
@@ -6061,7 +6179,7 @@ async function provisionRuntime(deps = {}) {
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const extract = deps.extract ?? defaultExtract;
   const now = deps.now ?? Date.now;
-  const staging = join6(dataDir(), `.staging-${process.pid}`);
+  const staging = join7(dataDir(), `.staging-${process.pid}`);
   try {
     await sweepAbandoned(dataDir());
     await sweepAbandoned(runtimeDir(), /^node\.tmp-(\d+)$/);
@@ -6110,11 +6228,11 @@ async function provisionRuntime(deps = {}) {
       try {
         await rm7(staging, { recursive: true, force: true });
         await mkdir8(staging, { recursive: true });
-        const archivePath = join6(staging, artifact.file);
+        const archivePath = join7(staging, artifact.file);
         await writeFile7(archivePath, bytes);
         await extract(archivePath, staging);
         const unpackedName = artifact.file.replace(/\.(tar\.gz|zip)$/, "");
-        await ensureCanonicalName(join6(staging, unpackedName), platform2);
+        await ensureCanonicalName(join7(staging, unpackedName), platform2);
         const target = runtimeDir();
         const retired = `${target}.old-${process.pid}`;
         await rm7(retired, { recursive: true, force: true });
@@ -6125,7 +6243,7 @@ async function provisionRuntime(deps = {}) {
         } catch {
         }
         try {
-          await rename3(join6(staging, unpackedName), target);
+          await rename3(join7(staging, unpackedName), target);
         } catch (err) {
           if (hadPrevious) await rename3(retired, target).catch(() => {
           });
@@ -6183,6 +6301,12 @@ async function main() {
       await provisionRuntime();
       return;
     }
+    // Not in USAGE: the synchronous SessionStart hook that warns a signed-out machine (GIA-67).
+    // It owns its output contract and swallows its own failures, so it can never be the reason a
+    // session start shows a hook error.
+    case "session-notice":
+      await sessionNoticeCommand();
+      return;
     case "logout":
       await logoutCommand();
       return;
